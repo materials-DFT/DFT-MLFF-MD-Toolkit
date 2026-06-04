@@ -11,6 +11,12 @@ VASP_KEEP_NAMES = frozenset(
     {"INCAR", "POSCAR", "POTCAR", "KPOINTS", "submit.vasp6.sh"}
 )
 
+# POSCAR is kept for VASP runs but is also common in LAMMPS/Allegro workflows.
+VASP_DIR_MARKERS = frozenset(
+    {"INCAR", "OUTCAR", "vasprun.xml", "OSZICAR", "POTCAR", "KPOINTS", "CONTCAR"}
+)
+LAMMPS_DIR_MARKERS = frozenset({"data.lammps", "log.lammps"})
+
 
 def is_regular_file(path: Path) -> bool:
     """True for ordinary files only (exclude symlinks, like find -type f)."""
@@ -29,8 +35,40 @@ def matches_lammps_pattern(name: str) -> bool:
     )
 
 
+def is_lammps_input_name(name: str) -> bool:
+    """Inputs and model artifacts that must never be removed by VASP cleanup."""
+    if name in {"data.lammps", "best.ckpt", "best.nequip.pt2"}:
+        return True
+    if name.startswith("submit.") and "lammps" in name:
+        return True
+    return name.startswith("in.") and (
+        name.endswith(".lammps")
+        or "allegro" in name
+        or fnmatch.fnmatch(name, "in.lammps*")
+    )
+
+
+def has_marker_file(target: Path, names: frozenset[str]) -> bool:
+    return any((target / name).is_file() for name in names)
+
+
+def is_lammps_directory(target: Path) -> bool:
+    if has_marker_file(target, LAMMPS_DIR_MARKERS):
+        return True
+    try:
+        for path in target.iterdir():
+            if path.is_file() and is_lammps_input_name(path.name):
+                return True
+    except OSError:
+        return False
+    return False
+
+
 def is_vasp_directory(target: Path) -> bool:
-    return (target / "INCAR").is_file() or (target / "POSCAR").is_file()
+    # POSCAR alone is not a VASP run (Allegro/LAMMPS dirs often keep POSCAR).
+    if is_lammps_directory(target):
+        return False
+    return has_marker_file(target, VASP_DIR_MARKERS)
 
 
 def immediate_vasp_subdirectories(target: Path) -> list[Path]:
@@ -51,7 +89,7 @@ def collect_vasp_files_to_delete(target: Path) -> list[Path]:
     for path in target.rglob("*"):
         if not is_regular_file(path):
             continue
-        if path.name in VASP_KEEP_NAMES:
+        if path.name in VASP_KEEP_NAMES or is_lammps_input_name(path.name):
             continue
         files.append(path)
     return sorted(files)
@@ -110,7 +148,10 @@ def main() -> None:
     target = target.resolve()
 
     vasp_scope = ""
-    if is_vasp_directory(target):
+    if is_lammps_directory(target):
+        mode = "LAMMPS"
+        files, lammps_scope = collect_lammps_files_to_delete(target)
+    elif is_vasp_directory(target):
         mode = "VASP"
         files = collect_vasp_files_to_delete(target)
         lammps_scope = ""

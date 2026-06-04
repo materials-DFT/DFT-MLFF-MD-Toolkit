@@ -63,7 +63,7 @@ DEFAULT_PARAMS = {
     "ISIF": "3",
     "EDIFF": "1E-5",
     "PREC": "Normal",
-    "ALGO": "Very Fast",
+    "ALGO": "Normal",
     "NELM": "150",
     "SIGMA": "0.05"
 }
