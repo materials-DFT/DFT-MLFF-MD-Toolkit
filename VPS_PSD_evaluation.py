@@ -1,53 +1,20 @@
 #!/usr/bin/env python3
 """
-Analyze VASP / LAMMPS MD simulations: velocity power spectrum, RDF, and MSD.
+Self-contained velocity PSD tool: VASP / LAMMPS MD trajectories → S(ν̃) and ∫S (or T).
 
-Entry points: ``plot_velocity_psd.py`` (PSD + cumulative ∫S only),
-``plot_rdf_msd.py`` (RDF + MSD only), or this module’s ``main()`` for the
-**combined** figure (all panels).
+This file embeds the full trajectory analysis and plotting stack (formerly
+shared with ``VACF_RDF_MSD_evaluation.py``) so it can run with no sibling imports.
 
-The full trajectory is used for VACF, PSD, RDF, and MSD (no equilibration
-frame skipping).
+CLI: ``python VPS_PSD_evaluation.py DIR … [options]`` opens **only** the PSD +
+cumulative-integral figure (RDF/MSD are still computed internally when needed
+for metadata but are not shown).
 
-Reads extended-XYZ trajectories from one or more directories and
-plots the velocity power spectrum in **one matplotlib window**, grouped
-**by temperature** (from directory names such as ``300K/``), with **one
-subplot row per atom species** for S(ν̃), and **one cumulative ∫S→T panel
-per temperature** with all species overlaid. RDF and MSD appear below the
-spectra in the same window.  Frequency axes use **wavenumber** (cm⁻¹); by
-default the PSD x-range is **trimmed** to where cumulative ∫S reaches a
-large fraction of ⟨v²⟩ (see ``--psd-trim-fraction``, default stricter than
-98%), below the high-ν̃ tail; the default ν̃ cap is a narrower THz band than
-before (see ``--psd-fmax``).
-Cumulative spectral integrals use the Wiener–Khinchin **linear** spectrum
-Re(FFT(R)) with one-sided folding (not ``|FFT(R)|²``).  ∫ S(ν̃) dν̃ equals
-⟨v²⟩ from the same VACF.  Values are converted to **K** via T = m⟨v²⟩/(3k_B).
-LAMMPS ``metal`` velocities (Å/ps): 100 m/s per unit; Å/fs: 10⁵ m/s per unit.
+The full trajectory is used (no equilibration frame skipping).
 
-The power spectrum comes from the normalized velocity autocorrelation
-(Wiener–Khinchin) and the cumulative integral of that spectrum. Unwrapping and RDF use full 3×3 lattice
-matrices (triclinic / non-orthogonal cells are supported).
-
-Supports VASP MD via **XDATCAR** (preferred) or **OUTCAR** ionic steps, and
-LAMMPS via **extxyz**.  When both XDATCAR and OUTCAR exist, **XDATCAR** is
-used so long runs do not require scanning a huge OUTCAR.
-Timestep is auto-detected from INCAR (POTIM) or LAMMPS input
-(timestep command).  When the trajectory contains velocities
-(LAMMPS extxyz), they are used directly; otherwise central
-finite-differences of unwrapped Cartesian positions are applied.
-
-Usage
------
-    python VACF_RDF_MSD_evaluation.py DIR1 [DIR2 ...] [options]   # combined figure
-    python plot_velocity_psd.py DIR1 …                         # PSD + ∫S only
-    python plot_rdf_msd.py DIR1 …                              # RDF + MSD only
-
-Examples
---------
-    python VACF_RDF_MSD_evaluation.py 300K/
-    python analyze_md.py dft/300K mlff/300K --labels "DFT" "MLFF"
-    python analyze_md.py . /path/mlff_parent/   # DFT/300K vs MLFF/300K from VASP vs LAMMPS
-    python analyze_md.py run/ --psd-fmax 1300 --save spectrum.png
+Physics and formats match the original combined evaluator: Wiener–Khinchin
+linear spectrum Re(FFT(R)), one-sided folding, wavenumber in cm⁻¹, optional
+trim to where ∫S reaches a fraction of ⟨v²⟩, T from m⟨v²⟩/(3k_B) when SI
+velocities apply.
 """
 
 import sys
@@ -986,6 +953,80 @@ _TIGHT_LAYOUT_DEFAULT = (0.055, 0.03, 0.985, 0.91)
 # RDF/MSD: legends on axes (upper right / upper left); no extra bottom margin for below-axes legend
 _TIGHT_LAYOUT_RDF_MSD = (0.055, 0.05, 0.985, 0.91)
 
+# ``make_psd_figure`` window: VPS column + cumulative ∫S/T; geometry vs default ``tight_layout`` rect.
+_PSD_ONLY_TIGHT_LAYOUT = (0.055, 0.03, 0.985, 0.927)
+_PSD_ONLY_SUPTITLE_Y = 0.968
+# **VPS** = velocity power spectrum (left column: S(ν̃) vs cm⁻¹). The S(ν̃) label is for that column only,
+# not the cumulative ∫S/T panel on the right. Gap = horizontal offset left of the VPS axes, in units of
+# one VPS subplot width; **smaller → label closer to the VPS curves**.
+_VPS_S_NU_LABEL_GAP_VS_AXIS_WIDTH = 0.038
+_PSD_ONLY_COLUMN_TITLE_PAD = 5.0
+
+
+def _apply_vps_psd_layout(fig):
+    """After tight_layout: anchor S(ν̃) beside the VPS column; tweak suptitle and column titles."""
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    for sf in fig.subfigs:
+        lab = getattr(sf, "_supylabel", None)
+        if lab is None:
+            continue
+        st = lab.get_text()
+        if r"$S(\tilde{\nu})$" not in st and st.strip() != "S(ν̃)":
+            continue
+        axes_sf = [a for a in sf.get_axes() if a.get_subplotspec() is not None]
+        if not axes_sf:
+            bb = sf.get_tightbbox(renderer).transformed(fig.transFigure.inverted())
+            y_fig = 0.5 * (bb.y0 + bb.y1)
+            lab.set_transform(fig.transFigure)
+            lab.set_position((bb.x0 + 0.02 * bb.width, y_fig))
+            continue
+        x0s = [a.get_position().x0 for a in axes_sf]
+        x_left = min(x0s)
+        vps_axes = [
+            a for a in axes_sf
+            if abs(a.get_position().x0 - x_left) <= 0.02
+        ]
+        if not vps_axes:
+            vps_axes = axes_sf
+        pos = [a.get_position() for a in vps_axes]
+        y0 = min(p.y0 for p in pos)
+        y1 = max(p.y1 for p in pos)
+        y_fig = 0.5 * (y0 + y1)
+        axis_w = max(p.width for p in pos)
+        x_fig = x_left - _VPS_S_NU_LABEL_GAP_VS_AXIS_WIDTH * axis_w
+        lab.set_transform(fig.transFigure)
+        lab.set_position((x_fig, y_fig))
+    for txt in fig.texts:
+        s = txt.get_text()
+        if "Velocity power spectra — MD comparison" in s:
+            txt.set_y(_PSD_ONLY_SUPTITLE_Y)
+    for ax in fig.axes:
+        ttl = ax.get_title()
+        if ttl == "Velocity power spectrum" or ttl.startswith("Cumulative ∫"):
+            # Use set_title(pad=…): ax.title may be Text-only (no set_pad) in some Matplotlib versions.
+            ax.set_title(ttl, pad=_PSD_ONLY_COLUMN_TITLE_PAD)
+
+
+def _finalize_psd_only_window(fig, save, maximize_window):
+    """Like ``_finalize_md_figure`` but spectrum-figure rect + VPS label pass after ``tight_layout``."""
+    import matplotlib.pyplot as plt
+
+    fig.tight_layout(rect=_PSD_ONLY_TIGHT_LAYOUT)
+    _apply_vps_psd_layout(fig)
+    display = os.environ.get("DISPLAY")
+    if save:
+        out_path = Path(save)
+        fig.savefig(out_path, dpi=200, bbox_inches="tight", pad_inches=0.15)
+        print(f"Saved figure → {out_path.resolve()}")
+    if not save or display:
+        if maximize_window and display:
+            fig.canvas.draw()
+            _maximize_figure_window(fig)
+        plt.show()
+    else:
+        plt.close(fig)
+
 
 def _finalize_md_figure(fig, save, maximize_window, tight_layout_rect=None):
     """tight_layout, optional save, show or close."""
@@ -1313,7 +1354,12 @@ def make_psd_figure(
     n_blocks = len(temp_groups)
     fig_h = max(6.0, 0.36 * sum(heights) + 0.85)
     fig = plt.figure(figsize=(13.5, fig_h))
-    fig.suptitle("Velocity power spectra — MD comparison", fontsize=13, weight="bold", y=0.992)
+    fig.suptitle(
+        "Velocity power spectra — MD comparison",
+        fontsize=13,
+        weight="bold",
+        y=_PSD_ONLY_SUPTITLE_Y,
+    )
     subfigs = fig.subfigures(
         n_blocks, 1, height_ratios=heights, hspace=_SUBFIG_HSPACE_TEMP_BLOCKS
     )
@@ -1339,7 +1385,7 @@ def make_psd_figure(
             show_cum_column_title=(bi == 0),
         )
 
-    _finalize_md_figure(fig, save, maximize_window)
+    _finalize_psd_only_window(fig, save, maximize_window)
 
 
 def make_rdf_msd_figure(
@@ -1885,57 +1931,80 @@ def finalize_plot_labels(dirs, user_labels, all_results,
 
 
 # ---------------------------------------------------------------------------
-#  CLI
+#  CLI (PSD + cumulative ∫S figure only)
 # ---------------------------------------------------------------------------
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Analyze VASP/LAMMPS MD: velocity PSD · ∫PSD · RDF · MSD",
+        description="Velocity PSD and cumulative ∫S (or T) — MD trajectories",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=f"""
+        epilog="""
 Examples:
   %(prog)s 300K/
-  %(prog)s .  /path/to/mlff_dir          (auto-expands to 300K, 700K, ...)
-  %(prog)s dft/300K mlff/300K --labels "DFT" "MLFF"
-  %(prog)s .  /path/to/mlff_parent/   # DFT/300K vs MLFF/300K from VASP vs LAMMPS
-  %(prog)s a/ b/ --series-prefixes VASP NEP   # override engine-based prefixes
-  %(prog)s run/ --psd-fmax 1300 --save psd.png      # spectrum x-limit (cm⁻¹)
-  %(prog)s dft/ mlff/ --data-log run.dat --no-plot   # data only, no figure
-  %(prog)s ~/vasp/oms6/md/ ~/lammps/oms6/            # VASP (XDATCAR) vs MLFF (extxyz)
+  %(prog)s dft/300K mlff/300K --labels DFT MLFF
+  %(prog)s run/ --psd-fmax 1300 --save psd.png
 """,
     )
-    ap.add_argument("dirs", nargs="+",
-                    help="simulation or parent directories to analyze")
-    ap.add_argument("--labels", nargs="+",
-                    help="legend labels (default: auto from dir names)")
+    ap.add_argument(
+        "dirs",
+        nargs="+",
+        help="simulation or parent directories to analyze",
+    )
+    ap.add_argument(
+        "--labels",
+        nargs="+",
+        help="legend labels (default: auto from dir names)",
+    )
     ap.add_argument(
         "--series-prefixes",
         nargs="+",
         default=None,
         metavar="PREFIX",
         help="one legend prefix per DIR argument; forces PREFIX/<T> and "
-             "overrides VASP→DFT / LAMMPS→MLFF detection",
+        "overrides VASP→DFT / LAMMPS→MLFF detection",
     )
-    ap.add_argument("--max-frames", type=int, default=None,
-                    help="max frames to read per directory")
-    ap.add_argument("--dt", type=float, default=None,
-                    help="override timestep in fs (default: auto from INCAR/LAMMPS input)")
-    ap.add_argument("--vacf-frames", type=int, default=5000,
-                    help="frames for VACF / power spectrum (default: 5000)")
-    ap.add_argument("--rdf-stride", type=int, default=10,
-                    help="frame stride for RDF (default: 10)")
-    ap.add_argument("--rdf-rmax", type=float, default=6.0,
-                    help="RDF cutoff in Å (default: 6.0)")
-    ap.add_argument("--rdf-bins", type=int, default=300,
-                    help="number of RDF bins (default: 300)")
-    ap.add_argument("--rdf-pairs", nargs="+", default=None,
-                    help="partial RDFs to plot, e.g. Mn-O K-O (default: total)")
+    ap.add_argument(
+        "--max-frames",
+        type=int,
+        default=None,
+        help="max frames to read per directory",
+    )
+    ap.add_argument(
+        "--dt",
+        type=float,
+        default=None,
+        help="override timestep in fs (default: auto from INCAR/LAMMPS input)",
+    )
+    ap.add_argument(
+        "--vacf-frames",
+        type=int,
+        default=5000,
+        help="frames for VACF / power spectrum (default: 5000)",
+    )
+    ap.add_argument(
+        "--rdf-stride",
+        type=int,
+        default=10,
+        help="frame stride for RDF computation (default: 10; not plotted here)",
+    )
+    ap.add_argument(
+        "--rdf-rmax",
+        type=float,
+        default=6.0,
+        help="RDF cutoff in Å (default: 6.0; not plotted here)",
+    )
+    ap.add_argument(
+        "--rdf-bins",
+        type=int,
+        default=300,
+        help="number of RDF bins (default: 300; not plotted here)",
+    )
     ap.add_argument(
         "--psd-fmax",
         type=float,
         default=DEFAULT_PSD_FMAX_CM1,
         help="upper ν̃ cap in cm⁻¹; auto-trim never exceeds this "
-             f"(default: ~{DEFAULT_PSD_FMAX_THZ:g} THz band)",
+        f"(default: ~{DEFAULT_PSD_FMAX_THZ:g} THz band)",
     )
     ap.add_argument(
         "--psd-no-trim",
@@ -1948,7 +2017,7 @@ Examples:
         default=DEFAULT_PSD_TRIM_FRACTION,
         metavar="F",
         help="trim PSD x-axis to ν̃ where cumulative ∫S reaches F×⟨v²⟩ "
-             f"(default {DEFAULT_PSD_TRIM_FRACTION:g}; lower = stricter, earlier cutoff)",
+        f"(default {DEFAULT_PSD_TRIM_FRACTION:g}; lower = stricter)",
     )
     ap.add_argument(
         "--psd-trim-margin",
@@ -1956,7 +2025,7 @@ Examples:
         default=DEFAULT_PSD_TRIM_MARGIN,
         metavar="M",
         help="extend trimmed ν̃ by fraction M past that point "
-             f"(default {DEFAULT_PSD_TRIM_MARGIN:g})",
+        f"(default {DEFAULT_PSD_TRIM_MARGIN:g})",
     )
     ap.add_argument(
         "--psd-smooth",
@@ -1964,31 +2033,35 @@ Examples:
         default=DEFAULT_PSD_SMOOTH,
         metavar="N",
         help="moving-average window (odd bins) for plotted PSD lines only; "
-             f"0 disables (default {DEFAULT_PSD_SMOOTH})",
+        f"0 disables (default {DEFAULT_PSD_SMOOTH})",
     )
     ap.add_argument(
         "--no-maximize",
         action="store_true",
         help="do not maximize the plot window to the screen (interactive only)",
     )
-    ap.add_argument("--msd-tmax", type=float, default=None,
-                    help="max lag time τ on MSD plot (ps; default: full range)")
-    ap.add_argument("--precomputed-msd", action="store_true",
-                    help="use msd_back_all.dat when available (default: compute from trajectory)")
-    ap.add_argument("--save", type=str, default=None,
-                    help="save the single combined figure to this path (png/pdf); "
-                         "use Agg when DISPLAY is unset")
+    ap.add_argument(
+        "--precomputed-msd",
+        action="store_true",
+        help="use msd_back_all.dat when available (default: compute from trajectory)",
+    )
+    ap.add_argument(
+        "--save",
+        type=str,
+        default=None,
+        help="save figure to this path (png/pdf); use Agg when DISPLAY is unset",
+    )
     ap.add_argument(
         "--data-log",
         type=str,
         default=None,
         metavar="FILE",
-        help="write power spectrum, VACF, MSD, and RDF data to FILE (tab-separated)",
+        help="write numerical data to FILE (tab-separated)",
     )
     ap.add_argument(
         "--no-plot",
         action="store_true",
-        help="skip matplotlib (no display, no --save file); use with --data-log for analysis only",
+        help="skip matplotlib; use with --data-log for analysis only",
     )
     args = ap.parse_args()
     skip_frames = 0
@@ -2001,11 +2074,18 @@ Examples:
 
     all_res = []
     for d in sim_dirs:
-        res = analyze_one(str(d), skip_frames, args.max_frames,
-                          args.rdf_stride, args.vacf_frames,
-                          args.rdf_rmax, args.rdf_bins,
-                          dt_override=args.dt,
-                          use_precomputed_msd=args.precomputed_msd)
+        res = analyze_one(
+            str(d),
+            skip_frames,
+            args.max_frames,
+            args.rdf_stride,
+            args.vacf_frames,
+            args.rdf_rmax,
+            args.rdf_bins,
+            dt_override=args.dt,
+            use_precomputed_msd=args.precomputed_msd,
+            compute_psd=True,
+        )
         all_res.append(res)
 
     labels = finalize_plot_labels(
@@ -2027,17 +2107,18 @@ Examples:
         if args.save:
             print("Note: --no-plot ignores --save (no figure written).", flush=True)
     else:
-        make_figure(all_res, labels,
-                    rdf_pairs=args.rdf_pairs,
-                    psd_fmax=args.psd_fmax,
-                    msd_tmax=args.msd_tmax,
-                    save=args.save,
-                    sim_dirs=sim_dirs,
-                    psd_trim=not args.psd_no_trim,
-                    psd_trim_fraction=args.psd_trim_fraction,
-                    psd_trim_margin=args.psd_trim_margin,
-                    psd_smooth=args.psd_smooth,
-                    maximize_window=not args.no_maximize)
+        make_psd_figure(
+            all_res,
+            labels,
+            sim_dirs,
+            psd_fmax=args.psd_fmax,
+            save=args.save,
+            psd_trim=not args.psd_no_trim,
+            psd_trim_fraction=args.psd_trim_fraction,
+            psd_trim_margin=args.psd_trim_margin,
+            psd_smooth=args.psd_smooth,
+            maximize_window=not args.no_maximize,
+        )
 
 
 if __name__ == "__main__":

@@ -35,13 +35,12 @@ K_B_SI = 1.380649e-23   # J/K
 AMU_KG = 1.66053906660e-27
 # Wavenumber: ν̃ (cm⁻¹) = f (Hz) / c (cm/s)
 SPEED_OF_LIGHT_CM_S = 2.99792458e10
-# Default ν̃ cap: SI frequency (THz → cm⁻¹). Stricter than former 50 THz so the
-# flat high-ν̃ tail is not shown by default; override with --psd-fmax.
-DEFAULT_PSD_FMAX_THZ = 24.0
-DEFAULT_PSD_FMAX_CM1 = DEFAULT_PSD_FMAX_THZ * 1e12 / SPEED_OF_LIGHT_CM_S
-# Cumulative ∫S trim: lower fraction stops before the tail; small margin past that ν̃.
-DEFAULT_PSD_TRIM_FRACTION = 0.92
-DEFAULT_PSD_TRIM_MARGIN = 0.01
+# Default ν̃ cap in cm⁻¹; auto-trim extends x-axis until VPS→0, capped here.
+DEFAULT_PSD_FMAX_CM1 = 2000.0
+DEFAULT_PSD_FMAX_THZ = DEFAULT_PSD_FMAX_CM1 * SPEED_OF_LIGHT_CM_S / 1e12
+# Auto-trim: extend x-axis until smoothed S(ν̃) < fraction × peak(S); margin past that.
+DEFAULT_PSD_TRIM_FRACTION = 0.02
+DEFAULT_PSD_TRIM_MARGIN = 0.10
 # Odd-length moving average (frequency bins) for PSD lines only; ∫S unchanged.
 DEFAULT_PSD_SMOOTH = 15
 ATOMIC_MASS = {
@@ -918,6 +917,64 @@ def psd_nu_max_from_cumint(freq_cm1, cumint, fraction=DEFAULT_PSD_TRIM_FRACTION)
     return float(freq_cm1[idx])
 
 
+def psd_nu_max_until_zero(freq_cm1, psd, fraction=DEFAULT_PSD_TRIM_FRACTION, smooth_window=31):
+    """Largest ν̃ (cm⁻¹) where smoothed |S(ν̃)| still exceeds ``fraction`` × peak |S|.
+
+    Uses a moving average to avoid noise bumps extending the range artificially.
+    Scans from high ν̃ downward to find where the VPS signal decays to near zero.
+    """
+    freq_cm1 = np.asarray(freq_cm1, dtype=float)
+    psd = np.asarray(psd, dtype=float)
+    if len(freq_cm1) < 2 or len(psd) < 2:
+        return float(freq_cm1[-1]) if len(freq_cm1) else 0.0
+    
+    p_abs = np.abs(psd)
+    peak = float(np.nanmax(p_abs))
+    if not np.isfinite(peak) or peak < 1e-40:
+        return 0.0
+    
+    # Smooth to avoid noise bumps
+    if smooth_window > 1 and len(p_abs) > smooth_window:
+        win = smooth_window if smooth_window % 2 == 1 else smooth_window + 1
+        kernel = np.ones(win) / win
+        p_smooth = np.convolve(p_abs, kernel, mode='same')
+    else:
+        p_smooth = p_abs
+    
+    floor = fraction * peak
+    idx = 0
+    for i in range(len(p_smooth) - 1, 0, -1):
+        if np.isfinite(p_smooth[i]) and p_smooth[i] > floor:
+            idx = i
+            break
+    return float(freq_cm1[idx])
+
+
+def psd_xmax_for_species(
+    series_pairs,
+    spec,
+    psd_fmax_cap,
+    trim,
+    trim_fraction,
+    trim_margin,
+):
+    """Upper ν̃ (cm⁻¹) for a single species' PSD subplot."""
+    if not trim:
+        return psd_fmax_cap
+    nu_end = 0.0
+    for R, _ in series_pairs:
+        if spec not in R.get("psd", {}):
+            continue
+        f = R["psd_freq_cm1"]
+        nu = psd_nu_max_until_zero(f, R["psd"][spec], fraction=trim_fraction)
+        if np.isfinite(nu):
+            nu_end = max(nu_end, nu)
+    if nu_end <= 0 or not np.isfinite(nu_end):
+        return psd_fmax_cap
+    xmax = min(psd_fmax_cap, nu_end * (1.0 + trim_margin))
+    return max(xmax, 1e-6)
+
+
 def psd_xmax_for_temperature_group(
     series_pairs,
     species_list,
@@ -926,27 +983,26 @@ def psd_xmax_for_temperature_group(
     trim_fraction,
     trim_margin,
 ):
-    """Upper ν̃ (cm⁻¹) for PSD/cumint x-axis: min(cap, auto) when *trim* is True."""
+    """Upper ν̃ (cm⁻¹) for PSD/cumint x-axis: min(cap, signal→0) when *trim* is True."""
     if not trim:
         return psd_fmax_cap
-    nu_peak = 0.0
+    nu_end = 0.0
     for R, _ in series_pairs:
         f = R["psd_freq_cm1"]
         for spec in species_list:
-            if spec not in R.get("psd_cumint", {}):
+            if spec not in R.get("psd", {}):
                 continue
-            cum = R["psd_cumint"][spec]
-            nu = psd_nu_max_from_cumint(f, cum, fraction=trim_fraction)
+            nu = psd_nu_max_until_zero(f, R["psd"][spec], fraction=trim_fraction)
             if np.isfinite(nu):
-                nu_peak = max(nu_peak, nu)
-    if nu_peak <= 0 or not np.isfinite(nu_peak):
+                nu_end = max(nu_end, nu)
+    if nu_end <= 0 or not np.isfinite(nu_end):
         return psd_fmax_cap
-    xmax = min(psd_fmax_cap, nu_peak * (1.0 + trim_margin))
+    xmax = min(psd_fmax_cap, nu_end * (1.0 + trim_margin))
     return max(xmax, 1e-6)
 
 
 # Vertical gap between stacked temperature subfigures (fraction of mean subfig height).
-_SUBFIG_HSPACE_TEMP_BLOCKS = 0.08
+_SUBFIG_HSPACE_TEMP_BLOCKS = 0.12
 
 # tight_layout rect (left, bottom, right, top)
 _TIGHT_LAYOUT_DEFAULT = (0.055, 0.03, 0.985, 0.91)
@@ -954,8 +1010,8 @@ _TIGHT_LAYOUT_DEFAULT = (0.055, 0.03, 0.985, 0.91)
 _TIGHT_LAYOUT_RDF_MSD = (0.055, 0.05, 0.985, 0.91)
 
 # ``make_psd_figure`` window: VPS column + cumulative ∫S/T; geometry vs default ``tight_layout`` rect.
-_PSD_ONLY_TIGHT_LAYOUT = (0.055, 0.03, 0.985, 0.927)
-_PSD_ONLY_SUPTITLE_Y = 0.968
+_PSD_ONLY_TIGHT_LAYOUT = (0.06, 0.05, 0.98, 0.98)
+_PSD_ONLY_SUPTITLE_Y = 0.965
 # **VPS** = velocity power spectrum (left column: S(ν̃) vs cm⁻¹). The S(ν̃) label is for that column only,
 # not the cumulative ∫S/T panel on the right. Gap = horizontal offset left of the VPS axes, in units of
 # one VPS subplot width; **smaller → label closer to the VPS curves**.
@@ -1011,13 +1067,17 @@ def _apply_vps_psd_layout(fig):
 def _finalize_psd_only_window(fig, save, maximize_window):
     """Like ``_finalize_md_figure`` but spectrum-figure rect + VPS label pass after ``tight_layout``."""
     import matplotlib.pyplot as plt
+    import warnings
 
-    fig.tight_layout(rect=_PSD_ONLY_TIGHT_LAYOUT)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for sf in fig.subfigs:
+            sf.subplots_adjust(hspace=0.55, left=0.10, right=0.98, top=0.88, bottom=0.15)
     _apply_vps_psd_layout(fig)
     display = os.environ.get("DISPLAY")
     if save:
         out_path = Path(save)
-        fig.savefig(out_path, dpi=200, bbox_inches="tight", pad_inches=0.15)
+        fig.savefig(out_path, dpi=200, bbox_inches="tight", pad_inches=0.18)
         print(f"Saved figure → {out_path.resolve()}")
     if not save or display:
         if maximize_window and display:
@@ -1088,15 +1148,19 @@ def _draw_psd_temperature_subfig(
             weight="bold",
             y=1.01,
         )
-    gs = sf.add_gridspec(nsp, 2, width_ratios=[1.06, 1.0])
-    ax_psd_ref = None
+    gs = sf.add_gridspec(
+        nsp, 2,
+        width_ratios=[1.0, 1.0],
+        wspace=0.35,
+        hspace=0.55,
+        top=0.85,
+        bottom=0.18,
+    )
     axes_psd = []
     for row in range(nsp):
-        ax_p = sf.add_subplot(gs[row, 0], sharex=ax_psd_ref)
-        if ax_psd_ref is None:
-            ax_psd_ref = ax_p
+        ax_p = sf.add_subplot(gs[row, 0])
         axes_psd.append(ax_p)
-    ax_cum = sf.add_subplot(gs[:, 1], sharex=ax_psd_ref)
+    ax_cum = sf.add_subplot(gs[:, 1])
 
     T_nom = None
     for R, _ in series_pairs:
@@ -1123,21 +1187,30 @@ def _draw_psd_temperature_subfig(
         psd_trim_fraction,
         psd_trim_margin,
     )
-    if psd_trim and psd_xmax + 1e-6 < psd_fmax:
+    # Compute per-species x-axis limits
+    species_xmax = {}
+    for spec in species_list:
+        species_xmax[spec] = psd_xmax_for_species(
+            series_pairs, spec, psd_fmax, psd_trim,
+            psd_trim_fraction, psd_trim_margin,
+        )
+    
+    if psd_trim:
+        xmax_info = ", ".join(f"{s}:{species_xmax[s]:.0f}" for s in species_list)
         print(
-            f"  PSD ν̃ range: 0–{psd_xmax:.1f} cm⁻¹ "
-            f"(∫S up to {psd_trim_fraction:.0%} of ⟨v²⟩ + {100*psd_trim_margin:.0f}% margin; "
-            f"cap {psd_fmax:.0f} cm⁻¹)",
+            f"  PSD ν̃ ranges (cm⁻¹): {xmax_info} "
+            f"(S > {psd_trim_fraction:g}×peak + {100*psd_trim_margin:.0f}% margin)",
             flush=True,
         )
 
     for row, spec in enumerate(species_list):
         ax_psd = axes_psd[row]
+        spec_xmax = species_xmax[spec]
         for j, (R, lab) in enumerate(series_pairs):
             if spec not in R["psd"]:
                 continue
             f_cm1 = R["psd_freq_cm1"]
-            cut = f_cm1 <= psd_xmax
+            cut = f_cm1 <= spec_xmax
             ff = f_cm1[cut]
             p = R["psd"][spec][cut]
             if psd_smooth and psd_smooth > 0:
@@ -1145,44 +1218,51 @@ def _draw_psd_temperature_subfig(
             kw = dict(color=colors[j % 10], label=lab, lw=1.4)
             ax_psd.plot(ff, p, **kw)
 
-        if shared_psd_s_ylabel:
-            ax_psd.set_ylabel(spec)
-        elif psd_si:
-            ax_psd.set_ylabel(
-                f"{spec}\n" + r"$S(\tilde{\nu})$ [(m/s)$^2$/cm$^{-1}$]"
-            )
-        else:
-            ax_psd.set_ylabel(f"{spec}\nS(ν̃)")
-        ax_psd.set_xlim(0, psd_xmax)
+        # Y-axis label: species name only (units shown once via supylabel)
+        ax_psd.set_ylabel(spec, fontsize=9, fontweight='bold')
+        ax_psd.set_xlim(0, spec_xmax)
+        ax_psd.tick_params(axis='both', labelsize=8)
         ax_psd.xaxis.set_minor_locator(AutoMinorLocator())
         ax_psd.yaxis.set_minor_locator(AutoMinorLocator())
         if row == 0 and show_psd_column_title:
-            ax_psd.set_title("Velocity power spectrum")
+            ax_psd.set_title("Velocity power spectrum", fontsize=10, pad=8)
+        # X-axis label only on bottom subplot
         if row == nsp - 1:
-            ax_psd.set_xlabel("Wavenumber (cm⁻¹)")
+            ax_psd.set_xlabel("Wavenumber (cm⁻¹)", fontsize=9)
         if row == 0:
             ax_psd.legend(
-                fontsize=6.5,
+                fontsize=7,
                 loc="upper right",
                 framealpha=0.92,
                 fancybox=False,
             )
 
-    if shared_psd_s_ylabel:
-        if psd_si:
-            sf.supylabel(
-                r"$S(\tilde{\nu})$ [(m/s)$^2$/cm$^{-1}$]",
-                fontsize=10,
-            )
-        else:
-            sf.supylabel("S(ν̃)", fontsize=10)
+    # Add shared y-axis units label for VPS column (positioned at middle row)
+    if psd_si:
+        mid_row = nsp // 2
+        ax_mid = axes_psd[mid_row]
+        # Add units below the species name using a text annotation
+        ax_mid.annotate(
+            r"[(m/s)$^2$/(cm$^{-1}$)]",
+            xy=(0, 0.5),
+            xycoords='axes fraction',
+            xytext=(-45, 0),
+            textcoords='offset points',
+            fontsize=8,
+            ha='center',
+            va='center',
+            rotation=90,
+        )
 
+    # Cumulative plot uses the max x-range across all species
+    cum_xmax = max(species_xmax.values()) if species_xmax else psd_xmax
+    
     for j, (R, lab) in enumerate(series_pairs):
         for si, spec in enumerate(species_list):
             if spec not in R["psd"]:
                 continue
             f_cm1 = R["psd_freq_cm1"]
-            cut = f_cm1 <= psd_xmax
+            cut = f_cm1 <= cum_xmax
             ff = f_cm1[cut]
             c_T = R.get("psd_cumint_T", {}).get(spec)
             if c_T is not None and np.any(np.isfinite(c_T)):
@@ -1216,8 +1296,10 @@ def _draw_psd_temperature_subfig(
 
     ax_cum.set_ylabel(
         "T (K) from ∫ S df" if has_T_axis else "∫ S df",
+        fontsize=9,
     )
-    ax_cum.set_xlim(0, psd_xmax)
+    ax_cum.set_xlim(0, cum_xmax)
+    ax_cum.tick_params(axis='both', labelsize=8)
     ax_cum.xaxis.set_minor_locator(AutoMinorLocator())
     ax_cum.yaxis.set_minor_locator(AutoMinorLocator())
     if show_cum_column_title:
@@ -1225,16 +1307,19 @@ def _draw_psd_temperature_subfig(
             "Cumulative ∫ S df → T (K), all species"
             if has_T_axis
             else "Cumulative ∫ S df, all species",
+            fontsize=10,
+            pad=8,
         )
-    ax_cum.set_xlabel("Wavenumber (cm⁻¹)")
+    ax_cum.set_xlabel("Wavenumber (cm⁻¹)", fontsize=9)
     n_cum_leg = len(series_pairs) * len(species_list)
     ax_cum.legend(
-        fontsize=5.8,
+        fontsize=6.5,
         loc="lower right",
-        ncol=2 if n_cum_leg > 4 else 1,
+        ncol=2 if n_cum_leg > 6 else 1,
         framealpha=0.92,
         fancybox=False,
-        handlelength=2.2,
+        handlelength=2.0,
+        columnspacing=1.0,
     )
     if T_nom is not None:
         ax_cum.text(
@@ -1349,19 +1434,14 @@ def make_psd_figure(
         for R, _ in series_pairs:
             species_set.update(R["psd"].keys())
         nsp = max(len(species_set), 1)
-        heights.append(max(2.0, 2.15 * nsp))
+        heights.append(max(3.0, 2.6 * nsp))
 
     n_blocks = len(temp_groups)
-    fig_h = max(6.0, 0.36 * sum(heights) + 0.85)
-    fig = plt.figure(figsize=(13.5, fig_h))
-    fig.suptitle(
-        "Velocity power spectra — MD comparison",
-        fontsize=13,
-        weight="bold",
-        y=_PSD_ONLY_SUPTITLE_Y,
-    )
+    fig_h = max(7.5, 0.42 * sum(heights) + 1.5)
+    fig = plt.figure(figsize=(14.0, fig_h))
+    fig.subplots_adjust(top=0.92, bottom=0.08)
     subfigs = fig.subfigures(
-        n_blocks, 1, height_ratios=heights, hspace=_SUBFIG_HSPACE_TEMP_BLOCKS
+        n_blocks, 1, height_ratios=heights, hspace=_SUBFIG_HSPACE_TEMP_BLOCKS + 0.04
     )
     subfigs = np.atleast_1d(subfigs).ravel()
 
@@ -2004,20 +2084,20 @@ Examples:
         type=float,
         default=DEFAULT_PSD_FMAX_CM1,
         help="upper ν̃ cap in cm⁻¹; auto-trim never exceeds this "
-        f"(default: ~{DEFAULT_PSD_FMAX_THZ:g} THz band)",
+        f"(default: {DEFAULT_PSD_FMAX_CM1:g} cm⁻¹)",
     )
     ap.add_argument(
         "--psd-no-trim",
         action="store_true",
-        help="use full 0…psd-fmax on PSD axes (no shrink to peak-dominated window)",
+        help="use full 0…psd-fmax on PSD axes (no auto-trim to where VPS→0)",
     )
     ap.add_argument(
         "--psd-trim-fraction",
         type=float,
         default=DEFAULT_PSD_TRIM_FRACTION,
         metavar="F",
-        help="trim PSD x-axis to ν̃ where cumulative ∫S reaches F×⟨v²⟩ "
-        f"(default {DEFAULT_PSD_TRIM_FRACTION:g}; lower = stricter)",
+        help="extend x-axis until |S| < F×peak(|S|) for all species "
+        f"(default {DEFAULT_PSD_TRIM_FRACTION:g}; lower = longer tail)",
     )
     ap.add_argument(
         "--psd-trim-margin",
