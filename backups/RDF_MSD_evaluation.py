@@ -3,15 +3,6 @@
 
 Combines RDF computation with MSD analysis from trajectory files.
 Supports VASP (XDATCAR, OUTCAR) and LAMMPS (extxyz) formats.
-
-MSD computation uses NPT-aware unwrapping schemes:
-- TOR (default): Displacement/TOR scheme (von Bulow et al., J. Chem. Phys. 153,
-  021101 (2020)), recommended for diffusion coefficients in NPT simulations.
-- Scaling: LAT scheme, accumulates fractional and scales by current cell.
-- Hybrid: Kulke & Vermaas (JCTC 2022), reversible geometry-preserving scheme.
-
-For NPT simulations (ISIF=3 in VASP), the XDATCAR reader detects per-step
-lattice vectors automatically.
 """
 
 import sys
@@ -45,17 +36,6 @@ ATOMIC_MASS = {
     "Po": 209.0, "At": 210.0, "Rn": 222.0, "Fr": 223.0, "Ra": 226.0, "Ac": 227.0,
     "Th": 232.0, "Pa": 231.0, "U": 238.0, "Np": 237.0, "Pu": 244.0,
 }
-
-UNWRAP_SCHEMES = ("tor", "scaling", "hybrid")
-
-
-def _get_masses(species):
-    """Return atomic masses for species, using ASE if available, else fallback dict."""
-    try:
-        from ase.data import atomic_masses, atomic_numbers
-        return np.array([atomic_masses[atomic_numbers[s]] for s in species], dtype=float)
-    except ImportError:
-        return np.array([ATOMIC_MASS.get(s, 1.0) for s in species], dtype=float)
 
 _FLOAT_RE = re.compile(
     r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
@@ -156,10 +136,7 @@ def read_outcar(path, skip=0, max_frames=None):
 
 
 def read_xyz(path, skip=0, max_frames=None):
-    """Fast reader for extended-XYZ / extxyz trajectories.
-    
-    Returns Cartesian positions and per-frame cells.
-    """
+    """Fast reader for extended-XYZ / extxyz trajectories."""
     positions, cells = [], []
     species = None
     with open(path) as fh:
@@ -196,211 +173,94 @@ def read_xyz(path, skip=0, max_frames=None):
     return np.array(positions), np.array(cells), species
 
 
-def read_fractional_xyz(path, skip=0, max_frames=None):
-    """Read an extended XYZ of fractional coordinates with per-frame lattices.
-    
-    The file is expected to have Lattice="..." tags with per-step cells.
-    Coordinates are assumed to be fractional.
-    
-    Returns (species, scaled[T, N, 3], cells[T, 3, 3]).
-    """
-    file_path = Path(path)
-    symbols = []
-    scaled_frames = []
-    cells = []
-
-    with file_path.open("r", encoding="utf-8") as handle:
-        idx, n_read = 0, 0
-        while True:
-            count_line = handle.readline()
-            if not count_line:
-                break
-            count_line = count_line.strip()
-            if not count_line:
-                continue
-            atom_count = int(count_line)
-
-            comment = handle.readline()
-            if not comment:
-                raise ValueError(f"Unexpected EOF reading comment in {file_path}")
-            
-            if idx < skip:
-                for _ in range(atom_count):
-                    handle.readline()
-                idx += 1
-                continue
-
-            cells.append(_parse_lattice(comment))
-
-            frame_symbols = []
-            coords = np.empty((atom_count, 3), dtype=float)
-            for atom_idx in range(atom_count):
-                fields = handle.readline().split()
-                if len(fields) < 4:
-                    raise ValueError(f"Malformed atom line in {file_path}")
-                frame_symbols.append(fields[0])
-                coords[atom_idx] = [float(v) for v in fields[1:4]]
-
-            if not symbols:
-                symbols = frame_symbols
-            scaled_frames.append(coords)
-            n_read += 1
-            idx += 1
-
-            if n_read % 5000 == 0:
-                print(f"    {n_read} frames ...", flush=True)
-            if max_frames and n_read >= max_frames:
-                break
-
-    if not scaled_frames:
-        raise ValueError(f"No frames were read from {file_path}")
-
-    print(f"    {n_read} frames, {atom_count} atoms (fractional XYZ)")
-    return symbols, np.stack(scaled_frames, axis=0), np.stack(cells, axis=0)
-
-
-def cartesian_to_fractional(cart_pos, cells):
-    """Convert Cartesian positions to fractional coordinates.
-    
-    Parameters
-    ----------
-    cart_pos : ndarray
-        Shape (T, N, 3) or (N, 3), Cartesian positions.
-    cells : ndarray
-        Shape (T, 3, 3) or (3, 3), lattice vectors as rows.
-    
-    Returns
-    -------
-    ndarray
-        Fractional positions with same shape as input.
-    """
-    if cart_pos.ndim == 2:
-        return cart_pos @ np.linalg.inv(cells)
-    frac = np.empty_like(cart_pos)
-    for i in range(cart_pos.shape[0]):
-        cell_i = cells[i] if cells.ndim == 3 else cells
-        frac[i] = cart_pos[i] @ np.linalg.inv(cell_i)
-    return frac
-
-
-def fractional_to_cartesian(frac_pos, cells):
-    """Convert fractional positions to Cartesian coordinates.
-    
-    Parameters
-    ----------
-    frac_pos : ndarray
-        Shape (T, N, 3) or (N, 3), fractional positions.
-    cells : ndarray
-        Shape (T, 3, 3) or (3, 3), lattice vectors as rows.
-    
-    Returns
-    -------
-    ndarray
-        Cartesian positions with same shape as input.
-    """
-    if frac_pos.ndim == 2:
-        return frac_pos @ cells
-    cart = np.empty_like(frac_pos)
-    for i in range(frac_pos.shape[0]):
-        cell_i = cells[i] if cells.ndim == 3 else cells
-        cart[i] = frac_pos[i] @ cell_i
-    return cart
-
-
 def read_xdatcar(path, skip=0, max_frames=None):
-    """Parse VASP XDATCAR, honoring per-step lattices in NPT (ISIF=3) runs.
-    
-    Standard NVT XDATCAR files contain a single header (scale + 3 lattice
-    vectors + species + counts) followed by "Direct configuration=" blocks.
-    NPT runs repeat the full header before every configuration. This parser
-    re-reads the header whenever a block is not introduced by a
-    "Direct configuration=" line, so the cell tracks the box every step.
-    
-    Returns fractional positions and per-frame cells. Caller should convert
-    to Cartesian as needed: cart = frac @ cell.
-    """
-    file_path = Path(path)
-    positions_frac, cells = [], []
+    """Parse VASP XDATCAR into Cartesian positions (A) and lattice per frame."""
+    positions, cells = [], []
     species = None
-    cell = np.eye(3)
-    sp_list = []
-    counts = []
-    total = 0
+    nat = None
     n_read = 0
+    seen = 0
     n_bad = 0
-
-    with open(file_path) as fh:
+    with open(path) as fh:
         while True:
-            line = fh.readline()
-            if not line:
+            comment = fh.readline()
+            if not comment:
                 break
-
-            if "Direct configuration=" not in line and "Direct" not in line:
-                scale_line = fh.readline()
-                if not scale_line:
-                    break
-                scale = float(scale_line.split()[0])
-
-                rows = []
-                for _ in range(3):
-                    rows.append([float(v) for v in fh.readline().split()])
-                cell = np.asarray(rows, dtype=float) * scale
-
-                sp_list = fh.readline().split()
-                counts = [int(v) for v in fh.readline().split()]
-                total = sum(counts)
-
-                config_line = fh.readline()
-                if not config_line:
-                    break
-
-            if total == 0:
-                raise ValueError(f"Missing header before coordinates in {file_path}")
-
-            coords = np.empty((total, 3), dtype=float)
+            scale_line = fh.readline()
+            if not scale_line:
+                break
+            scale = float(scale_line.split()[0])
+            cell = np.empty((3, 3))
+            for i in range(3):
+                cell[i] = np.array(fh.readline().split()[:3], dtype=float)
+            cell = cell * scale
+            sp_line = fh.readline()
+            cnt_line = fh.readline()
+            if sp_line is None or cnt_line is None:
+                break
+            sp_tokens = sp_line.split()
+            counts = [int(x) for x in cnt_line.split()]
+            if species is None:
+                if len(sp_tokens) != len(counts):
+                    raise ValueError(
+                        f"XDATCAR species/count mismatch in {path}: "
+                        f"{sp_tokens!r} vs {counts!r}"
+                    )
+                species = []
+                for s, n in zip(sp_tokens, counts):
+                    species.extend([s] * n)
+                nat = len(species)
+            else:
+                if sum(counts) != nat:
+                    raise ValueError(
+                        f"XDATCAR atom count changed in {path}: expected {nat}, got {sum(counts)}"
+                    )
+            cfg_line = fh.readline()
+            if not cfg_line:
+                break
+            cfg_l = cfg_line.strip().lower()
+            if "cartesian" in cfg_l:
+                direct = False
+            elif "direct" in cfg_l:
+                direct = True
+            else:
+                direct = not cfg_l.startswith("c")
+            seen += 1
+            pos = np.empty((nat, 3))
             bad_frame = False
-            for atom_idx in range(total):
-                coord_line = fh.readline()
-                if not coord_line:
-                    raise ValueError(f"XDATCAR truncated in {file_path}")
+            for a in range(nat):
+                ln = fh.readline()
+                if not ln:
+                    raise ValueError(f"XDATCAR truncated in {path}")
                 try:
-                    coords[atom_idx] = _parse_first_three_floats(coord_line, f"XDATCAR {path}")
+                    pos[a] = _parse_first_three_floats(ln, f"XDATCAR {path}")
                 except ValueError as exc:
                     bad_frame = True
                     n_bad += 1
-                    print(f"    Warning: skipping corrupted frame: {exc}", flush=True)
-                    for _ in range(atom_idx + 1, total):
+                    print(
+                        f"    Warning: skipping corrupted XDATCAR frame {seen} in {path}: {exc}",
+                        flush=True,
+                    )
+                    for _ in range(a + 1, nat):
                         if not fh.readline():
-                            raise ValueError(f"XDATCAR truncated in {file_path}")
+                            raise ValueError(f"XDATCAR truncated in {path}")
                     break
-
             if bad_frame:
                 continue
-
-            if species is None:
-                species = []
-                for elem, cnt in zip(sp_list, counts):
-                    species.extend([elem] * cnt)
-
-            if skip > 0:
-                skip -= 1
+            if direct:
+                pos = pos @ cell
+            if seen <= skip:
                 continue
-
-            positions_frac.append(coords)
+            positions.append(pos)
             cells.append(cell.copy())
             n_read += 1
-
             if n_read % 5000 == 0:
                 print(f"    {n_read} frames ...", flush=True)
             if max_frames is not None and n_read >= max_frames:
                 break
-
-    if not positions_frac:
-        raise ValueError(f"No frames were read from {file_path}")
-
     bad_tag = f", skipped {n_bad} corrupted frame(s)" if n_bad else ""
-    print(f"    {n_read} frames, {total} atoms (XDATCAR NPT-aware{bad_tag})")
-    return np.stack(positions_frac, axis=0), np.stack(cells, axis=0), species
+    print(f"    {n_read} frames, {nat} atoms (XDATCAR{bad_tag})")
+    return np.array(positions), np.array(cells), species
 
 
 def find_trajectory(directory):
@@ -501,99 +361,8 @@ def _legend_prefix_from_engine(md_engine):
 #  Physics: unwrap, RDF, MSD
 # ---------------------------------------------------------------------------
 
-def _unwrap_tor(scaled, cells):
-    """Displacement/TOR unwrap: accumulate min-image displacements per step.
-    
-    This is the recommended scheme for diffusion coefficients (von Bulow et al.,
-    J. Chem. Phys. 153, 021101 (2020)).
-    """
-    unwrapped = np.empty_like(scaled)
-    unwrapped[0] = scaled[0] @ cells[0]
-    for i in range(1, scaled.shape[0]):
-        delta = scaled[i] - scaled[i - 1]
-        delta -= np.round(delta)
-        unwrapped[i] = unwrapped[i - 1] + delta @ cells[i]
-    return unwrapped
-
-
-def _unwrap_scaling(scaled, cells):
-    """Scaling/LAT unwrap: accumulate fractional, scale by the current cell."""
-    unwrapped_frac = np.empty_like(scaled)
-    unwrapped_frac[0] = scaled[0]
-    for i in range(1, scaled.shape[0]):
-        delta = scaled[i] - scaled[i - 1]
-        delta -= np.round(delta)
-        unwrapped_frac[i] = unwrapped_frac[i - 1] + delta
-    return np.einsum("tni,tij->tnj", unwrapped_frac, cells)
-
-
-def _unwrap_hybrid(scaled, cells):
-    """Hybrid unwrap (Kulke & Vermaas, JCTC 2022, Eq. 12).
-    
-    Reversible, geometry-preserving scheme that corrects the displacement
-    scheme with a (L_{i+1} - L_i) term accounting for box rescaling.
-    Defined for orthogonal boxes.
-    """
-    n_frames = scaled.shape[0]
-    lengths = np.linalg.norm(cells, axis=2)
-    wrapped_cart = scaled * lengths[:, None, :]
-    unwrapped_cart = np.empty_like(scaled)
-    unwrapped_cart[0] = wrapped_cart[0]
-
-    def _round_half_up(values):
-        return np.floor(values + 0.5)
-
-    for i in range(1, n_frames):
-        length = lengths[i]
-        length_prev = lengths[i - 1]
-        step = wrapped_cart[i] - wrapped_cart[i - 1]
-        prev_offset = wrapped_cart[i - 1] - unwrapped_cart[i - 1]
-        unwrapped_cart[i] = (
-            unwrapped_cart[i - 1]
-            + step
-            - length * _round_half_up(step / length)
-            - (length - length_prev) * _round_half_up(prev_offset / length_prev)
-        )
-    return unwrapped_cart
-
-
-def unwrap_positions_npt(scaled, cells, scheme="tor"):
-    """Unwrap wrapped fractional positions into continuous Cartesian space.
-    
-    Parameters
-    ----------
-    scaled : ndarray
-        Wrapped fractional positions, shape (T, N, 3).
-    cells : ndarray
-        Per-frame row-vector cells, shape (T, 3, 3).
-    scheme : str
-        One of "tor" (default, recommended for diffusion), "scaling", or "hybrid".
-    
-    Returns
-    -------
-    ndarray
-        Unwrapped Cartesian positions, shape (T, N, 3).
-    """
-    scaled = np.asarray(scaled, dtype=float)
-    cells = np.asarray(cells, dtype=float)
-    if scaled.shape[0] < 2:
-        raise ValueError("Need at least two frames to unwrap a trajectory.")
-    
-    normalized = scheme.lower()
-    if normalized == "tor":
-        return _unwrap_tor(scaled, cells)
-    if normalized == "scaling":
-        return _unwrap_scaling(scaled, cells)
-    if normalized == "hybrid":
-        return _unwrap_hybrid(scaled, cells)
-    raise ValueError(f"Unknown unwrap scheme {scheme!r}. Choose from {UNWRAP_SCHEMES}.")
-
-
 def unwrap(pos, cells):
-    """Remove PBC jumps from Cartesian trajectory (legacy compatibility).
-    
-    For new code, prefer unwrap_positions_npt() with fractional input.
-    """
+    """Remove PBC jumps from Cartesian trajectory."""
     nf = len(pos)
     uw = np.empty_like(pos)
     uw[0] = pos[0]
@@ -605,32 +374,20 @@ def unwrap(pos, cells):
     return uw
 
 
-def remove_com_drift_cartesian(positions, masses):
-    """Subtract mass-weighted COM position from each frame.
-    
-    Parameters
-    ----------
-    positions : ndarray
-        Shape (T, N, 3), Cartesian positions.
-    masses : ndarray
-        Shape (N,), atomic masses.
-    
-    Returns
-    -------
-    ndarray
-        Positions with COM drift removed.
-    """
-    total_mass = float(np.sum(masses))
-    if total_mass <= 0.0:
-        return positions
-    com = np.sum(positions * masses[None, :, None], axis=1, keepdims=True) / total_mass
-    return positions - com
+def _mass_array(species):
+    """Return per-atom masses for mass-weighted COM removal."""
+    masses = np.ones(len(species), dtype=float)
+    for i, s in enumerate(species):
+        masses[i] = ATOMIC_MASS.get(s, 1.0)
+    return masses
 
 
 def remove_com_drift(unwrapped, species):
-    """Subtract mass-weighted COM position at every frame (legacy interface)."""
-    masses = _get_masses(species)
-    return remove_com_drift_cartesian(unwrapped, masses)
+    """Subtract mass-weighted COM position at every frame."""
+    masses = _mass_array(species)
+    msum = np.sum(masses)
+    com = np.tensordot(unwrapped, masses, axes=([1], [0])) / msum
+    return unwrapped - com[:, None, :]
 
 
 def compute_rdf(pos, cells, species,
@@ -694,89 +451,141 @@ def compute_rdf(pos, cells, species,
     return results
 
 
-def _ordered_elements(species):
-    """Return unique element labels in first-appearance order."""
-    ordered = []
-    for s in species:
-        if s not in ordered:
-            ordered.append(s)
-    return ordered
+def _compute_msd_array(unwrapped):
+    """Time-averaged MSD from unwrapped Cartesian coordinates (A)."""
+    nf, na, nd = unwrapped.shape
+    nfft = 1 << int(np.ceil(np.log2(2 * nf)))
+    norm = np.arange(nf, 0, -1, dtype=float)
+    lag = np.arange(nf)
+    msd = np.zeros(nf)
+    for d in range(nd):
+        x = unwrapped[:, :, d]
+        xf = np.fft.rfft(x, n=nfft, axis=0)
+        acf = np.fft.irfft(xf * np.conj(xf), n=nfft, axis=0)[:nf]
+        x2 = x ** 2
+        cs = np.concatenate([np.zeros((1, na)), np.cumsum(x2, axis=0)])
+        D = cs[nf] - cs[lag] + cs[nf - lag]
+        msd += np.sum((D - 2 * acf) / norm[:, None], axis=1)
+    return msd / na
 
 
-def compute_msd_npt(
-    frac_positions, cells, species, dt_fs,
-    scheme="tor", remove_com=True
-):
-    """Compute single-origin MSD from fractional positions using NPT-aware unwrapping.
-    
-    Uses the displacement/TOR scheme (von Bulow et al., J. Chem. Phys. 153, 021101 (2020))
-    by default, which is recommended for diffusion coefficients in NPT simulations.
-    
-    Parameters
-    ----------
-    frac_positions : ndarray
-        Fractional (scaled) positions, shape (T, N, 3).
-    cells : ndarray
-        Per-frame lattice vectors, shape (T, 3, 3), rows are lattice vectors.
-    species : list
-        Element symbols for each atom.
-    dt_fs : float
-        Timestep in femtoseconds.
-    scheme : str
-        Unwrapping scheme: "tor" (default), "scaling", or "hybrid".
-    remove_com : bool
-        Subtract mass-weighted center-of-mass drift (default True).
-    
-    Returns
-    -------
-    msd_t : ndarray
-        Time array in picoseconds, shape (T-1,).
-    msd : dict
-        Dictionary mapping element symbol to MSD array (Angstrom^2), shape (T-1,).
+def compute_msd(unwrapped, dt_fs):
+    """Total MSD for all atoms."""
+    t = np.arange(unwrapped.shape[0]) * dt_fs * 1e-3
+    return t, _compute_msd_array(unwrapped)
+
+
+def compute_msd_by_species(unwrapped, dt_fs, species):
+    """Compute MSD for each species separately."""
+    sp = np.array(species)
+    t = np.arange(unwrapped.shape[0]) * dt_fs * 1e-3
+    out = {}
+    for s in sorted(set(species)):
+        out[s] = _compute_msd_array(unwrapped[:, sp == s, :])
+    return t, out
+
+
+def compute_msd_single_origin(positions, cells, species, dt_fs, remove_com_drift=True):
     """
-    n_frames = frac_positions.shape[0]
-    if n_frames < 2:
-        raise ValueError("Need at least two frames to compute MSD.")
+    Calculate MSD using single-origin method with step-by-step unwrapping.
     
-    print(f"  Unwrapping trajectory ({scheme} scheme)...")
-    unwrapped_cart = unwrap_positions_npt(frac_positions, cells, scheme=scheme)
+    This is the same algorithm as MSD_plotting.py's MSD and MSD_from_extxyz functions.
+    It computes displacement from the initial frame (frame 0) for each atom,
+    properly handling periodic boundary conditions by detecting jumps > 0.5 in
+    fractional coordinates.
     
-    if remove_com:
-        masses = _get_masses(species)
-        unwrapped_cart = remove_com_drift_cartesian(unwrapped_cart, masses)
-        print("  COM drift removed.")
+    For NPT simulations, this uses per-frame lattice vectors to convert between
+    fractional and Cartesian coordinates, avoiding artifacts from cell shape changes.
     
-    element_list = _ordered_elements(species)
-    symbol_array = np.asarray(species)
-    element_indices = {elem: np.where(symbol_array == elem)[0] for elem in element_list}
+    Args:
+        positions: Array of Cartesian positions (n_frames, n_atoms, 3)
+        cells: Array of lattice vectors (n_frames, 3, 3)
+        species: List of element symbols for each atom
+        dt_fs: Timestep in femtoseconds
+        remove_com_drift: If True, subtract center-of-mass drift (default True)
     
-    origin = unwrapped_cart[0]
-    displacements = unwrapped_cart[1:] - origin[None, :, :]
-    squared_total = np.sum(displacements ** 2, axis=2)
+    Returns:
+        msd_t: Time array in picoseconds
+        msd: Dictionary mapping element symbol to MSD array (Angstrom^2)
+    """
+    n_frames = len(positions)
+    N = len(species)
     
-    msd = {}
-    for elem in element_list:
-        indices = element_indices[elem]
-        msd[elem] = np.mean(squared_total[:, indices], axis=1)
+    element_list = []
+    element_dict = {}
+    for elem in species:
+        if elem not in element_list:
+            element_list.append(elem)
+        element_dict[elem] = element_dict.get(elem, 0) + 1
     
-    msd_t = np.arange(1, n_frames) * dt_fs * 1e-3
+    masses = np.array([ATOMIC_MASS.get(elem, 1.0) for elem in species])
+    total_mass = np.sum(masses)
     
-    print(f"  MSD done ({n_frames - 1} time points, {len(element_list)} species)")
+    lattice0 = cells[0]
+    cart0 = positions[0]
+    frac0 = cart0 @ np.linalg.inv(lattice0)
+    
+    if remove_com_drift:
+        com_origin = np.sum(masses[:, np.newaxis] * cart0, axis=0) / total_mass
+        com_unwrapped = com_origin.copy()
+    
+    unwrapped_frac = frac0.copy()
+    prev_frac = frac0.copy()
+    
+    msd_results = {el: [] for el in element_list}
+    time_ps = []
+    
+    print(f"  Processing {n_frames} frames for MSD (single-origin method)...")
+    
+    for step in range(1, n_frames):
+        lattice = cells[step]
+        lattice_inv = np.linalg.inv(lattice)
+        wrapped_cart = positions[step]
+        wrapped_frac = wrapped_cart @ lattice_inv
+        
+        delta_frac = wrapped_frac - prev_frac
+        delta_frac = delta_frac - np.round(delta_frac)
+        
+        unwrapped_frac = unwrapped_frac + delta_frac
+        
+        unwrapped_cart = unwrapped_frac @ lattice
+        origin_cart = frac0 @ lattice
+        
+        if remove_com_drift:
+            com_current = np.sum(masses[:, np.newaxis] * unwrapped_cart, axis=0) / total_mass
+            com_origin_current = np.sum(masses[:, np.newaxis] * origin_cart, axis=0) / total_mass
+            com_drift_vec = com_current - com_origin_current
+            
+            disp = (unwrapped_cart - com_drift_vec) - origin_cart
+        else:
+            disp = unwrapped_cart - origin_cart
+        
+        msd_per_atom = np.sum(disp**2, axis=1)
+        
+        msd_dict = {el: 0.0 for el in element_list}
+        for atom in range(N):
+            elem = species[atom]
+            msd_dict[elem] += msd_per_atom[atom] / element_dict[elem]
+        
+        time_ps.append(step * dt_fs / 1000.0)
+        for el in element_list:
+            msd_results[el].append(msd_dict[el])
+        
+        prev_frac = wrapped_frac.copy()
+        
+        if step % 1000 == 0:
+            print(f"    MSD step {step}...", flush=True)
+    
+    print("  MSD calculation complete.")
+    
+    msd_t = np.array(time_ps)
+    msd = {el: np.array(msd_results[el]) for el in element_list}
+    
+    if remove_com_drift:
+        final_com_drift = np.linalg.norm(com_drift_vec)
+        print(f"  COM drift correction applied. Final COM drift: {final_com_drift:.4f} A")
+    
     return msd_t, msd
-
-
-def compute_msd_from_cartesian(
-    cart_positions, cells, species, dt_fs,
-    scheme="tor", remove_com=True
-):
-    """Compute MSD from Cartesian positions by first converting to fractional.
-    
-    This is a convenience wrapper for trajectories that were read as Cartesian
-    (e.g., from OUTCAR or extxyz).
-    """
-    print("  Converting Cartesian to fractional coordinates...")
-    frac_positions = cartesian_to_fractional(cart_positions, cells)
-    return compute_msd_npt(frac_positions, cells, species, dt_fs, scheme=scheme, remove_com=remove_com)
 
 
 # ---------------------------------------------------------------------------
@@ -1054,7 +863,7 @@ def make_rdf_msd_figure(
 
 def analyze_one(directory, skip, max_frames,
                 rdf_stride, rdf_rmax, rdf_nbins,
-                dt_override=None, unwrap_scheme="tor"):
+                dt_override=None):
     """Analyze a single simulation directory for RDF and MSD.
     
     Args:
@@ -1065,11 +874,9 @@ def analyze_one(directory, skip, max_frames,
         rdf_rmax: RDF cutoff in Angstroms
         rdf_nbins: Number of RDF bins
         dt_override: Override timestep in fs (None for auto-detect)
-        unwrap_scheme: Unwrapping scheme for MSD ("tor", "scaling", "hybrid")
     
-    MSD is computed using the specified unwrapping scheme with per-frame lattice
-    vectors. The TOR scheme (von Bulow et al.) is recommended for diffusion
-    coefficients in NPT simulations.
+    MSD is computed using single-origin method with per-frame lattice vectors,
+    which properly handles NPT simulations and matches MSD_plotting.py behavior.
     """
     d = Path(directory).resolve()
     print(f"\n{'=' * 60}")
@@ -1095,8 +902,6 @@ def analyze_one(directory, skip, max_frames,
         "xdatcar": read_xdatcar,
     }
     reader = readers.get(traj_fmt, read_xyz)
-    coords_are_fractional = (traj_fmt == "xdatcar")
-    
     try:
         pos, cells, species = reader(traj_path, skip=skip, max_frames=max_frames)
     except Exception as exc:
@@ -1118,11 +923,9 @@ def analyze_one(directory, skip, max_frames,
             )
             traj_path, traj_fmt = fallback_path, fallback_fmt
             reader = readers[fallback_fmt]
-            coords_are_fractional = (fallback_fmt == "xdatcar")
             pos, cells, species = reader(traj_path, skip=skip, max_frames=max_frames)
         else:
             raise
-    
     nf = len(pos)
     if nf == 0:
         raise ValueError(
@@ -1135,21 +938,12 @@ def analyze_one(directory, skip, max_frames,
     md_engine = _infer_md_engine(d, traj_fmt, src)
     print(f"  MD engine: {md_engine}")
 
-    if coords_are_fractional:
-        frac_pos = pos
-        cart_pos = fractional_to_cartesian(pos, cells)
-    else:
-        cart_pos = pos
-        frac_pos = cartesian_to_fractional(pos, cells)
-
     print(f"  RDF (stride={rdf_stride}, rmax={rdf_rmax} A) ...")
-    rdf_res = compute_rdf(cart_pos, cells, species,
+    rdf_res = compute_rdf(pos, cells, species,
                           r_max=rdf_rmax, n_bins=rdf_nbins,
                           stride=rdf_stride)
 
-    print(f"  MSD (scheme={unwrap_scheme}) ...")
-    msd_t, msd = compute_msd_npt(frac_pos, cells, species, dt,
-                                  scheme=unwrap_scheme, remove_com=True)
+    msd_t, msd = compute_msd_single_origin(pos, cells, species, dt, remove_com_drift=True)
 
     sk_dir, _ = infer_temperature_from_path(d)
     nominal_T = float(sk_dir) if sk_dir is not None else None
@@ -1161,10 +955,9 @@ def analyze_one(directory, skip, max_frames,
         "trajectory": str(Path(traj_path).resolve()),
         "trajectory_format": traj_fmt,
         "n_frames": int(nf),
-        "n_atoms": int(cart_pos.shape[1]),
+        "n_atoms": int(pos.shape[1]),
         "species": sorted(set(species)),
         "nominal_temperature_K": nominal_T,
-        "unwrap_scheme": unwrap_scheme,
     }
     return dict(
         rdf=rdf_res,
@@ -1253,7 +1046,6 @@ def write_data_log(out_path, sim_dirs, labels, all_results):
                     "n_frames",
                     "n_atoms",
                     "nominal_temperature_K",
-                    "unwrap_scheme",
                 ):
                     if k in m:
                         fh.write(f"# meta.{k}={m[k]}\n")
@@ -1399,13 +1191,6 @@ Examples:
         help="max lag time t on MSD plot (ps; default: full range)",
     )
     ap.add_argument(
-        "--unwrap-scheme",
-        choices=list(UNWRAP_SCHEMES),
-        default="tor",
-        help="unwrapping scheme for MSD: tor (default, recommended for diffusion), "
-             "scaling, or hybrid",
-    )
-    ap.add_argument(
         "--no-maximize",
         action="store_true",
         help="do not maximize the plot window to the screen",
@@ -1447,7 +1232,6 @@ Examples:
             args.rdf_rmax,
             args.rdf_bins,
             dt_override=args.dt,
-            unwrap_scheme=args.unwrap_scheme,
         )
         all_res.append(res)
 
