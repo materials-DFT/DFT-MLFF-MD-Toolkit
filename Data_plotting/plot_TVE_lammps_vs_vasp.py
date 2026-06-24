@@ -453,11 +453,67 @@ def compute_running_average(data, window):
     return np.convolve(data, kernel, mode='valid')
 
 
+def _volume_decimal_places(vmin, vmax):
+    """Choose y-tick precision so distinct volumes read as 737.9972 vs 738."""
+    span = abs(vmax - vmin)
+    if span < 1e-12:
+        text = f"{vmax:.8f}".rstrip("0").rstrip(".")
+        if "." not in text:
+            return 0
+        return min(len(text.split(".")[1]), 4)
+    for decimals in range(5):
+        if round(vmin, decimals) != round(vmax, decimals):
+            return decimals
+    return 4
+
+
+def _configure_volume_axis(ax, vol_arrays):
+    """Use a broad y-range for near-constant NVT volumes and label true values."""
+    from matplotlib.ticker import FixedLocator, FuncFormatter, MaxNLocator
+
+    finite = np.concatenate(
+        [arr[np.isfinite(arr)] for arr in vol_arrays if len(arr) > 0]
+    )
+    if finite.size == 0:
+        return
+
+    vmin = float(np.min(finite))
+    vmax = float(np.max(finite))
+    vmean = float(np.mean(finite))
+    span = vmax - vmin
+
+    # Matplotlib autoscale zooms in when span is tiny; keep a readable context window.
+    if span < max(1.0, abs(vmean) * 1e-4):
+        pad = max(1.0, abs(vmean) * 0.01)
+        ax.set_ylim(vmin - pad, vmax + pad)
+    else:
+        pad = max(0.05 * span, 1e-6)
+        ax.set_ylim(vmin - pad, vmax + pad)
+
+    decimals = _volume_decimal_places(vmin, vmax)
+    ylo, yhi = ax.get_ylim()
+
+    if span < max(1.0, abs(vmean) * 1e-4):
+        tick_vals = sorted({float(v) for v in np.unique(finite)})
+        for edge in (np.floor(vmin) - 1, np.floor(vmin), np.ceil(vmax), np.ceil(vmax) + 1):
+            if ylo <= edge <= yhi:
+                tick_vals.append(float(edge))
+        tick_vals = sorted(set(round(t, max(decimals, 0)) for t in tick_vals))
+        ax.yaxis.set_major_locator(FixedLocator(tick_vals))
+    else:
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=6))
+
+    ax.yaxis.set_major_formatter(
+        FuncFormatter(lambda y, _pos, d=decimals: f"{y:.{d}f}")
+    )
+
+
 def plot_thermo_axes(ax_temp, ax_vol, ax_energy, results_list, labels, 
                      colors, ls_cycle, tmax=None, running_avg=None):
     """Plot temperature, volume, and energy on given axes."""
     from matplotlib.ticker import AutoMinorLocator
     
+    plotted_volumes = []
     for i, (R, lab) in enumerate(zip(results_list, labels)):
         t = R["time_ps"]
         temp = R["temperature"]
@@ -471,6 +527,7 @@ def plot_thermo_axes(ax_temp, ax_vol, ax_energy, results_list, labels,
             vol = vol[mask]
             energy = energy[mask]
         
+        plotted_volumes.append(vol)
         ls = ls_cycle[i % len(ls_cycle)]
         color = colors[i % len(colors)]
         
@@ -502,6 +559,7 @@ def plot_thermo_axes(ax_temp, ax_vol, ax_energy, results_list, labels,
     ax_vol.set_xlabel("Time (ps)")
     ax_vol.set_ylabel("Volume (A^3)")
     ax_vol.set_title("Volume")
+    _configure_volume_axis(ax_vol, plotted_volumes)
     ax_vol.legend(fontsize=7, framealpha=0.92, loc="best", fancybox=False)
     ax_vol.xaxis.set_minor_locator(AutoMinorLocator())
     
