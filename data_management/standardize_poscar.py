@@ -121,12 +121,24 @@ def write_concatenated_poscars(file_path, atoms_list):
     with open(file_path, 'w') as f:
         f.write(''.join(poscar_texts))
 
+def collect_structure_files(path):
+    """Return POSCAR/.vasp structure files under a directory (recursive)."""
+    structure_files = []
+    for dirpath, _, filenames in os.walk(path):
+        if 'POSCAR' in filenames:
+            structure_files.append(os.path.join(dirpath, 'POSCAR'))
+        for filename in sorted(filenames):
+            if filename.endswith('.vasp'):
+                structure_files.append(os.path.join(dirpath, filename))
+    return structure_files
+
+
 def main():
     """
     Main function to process POSCAR files from command-line input.
     """
     if len(sys.argv) < 2:
-        print("Usage: python reorder_poscar.py <file_or_directory_path>")
+        print("Usage: python standardize_poscar.py <file_or_directory_path>")
         sys.exit(1)
 
     path = sys.argv[1]
@@ -137,10 +149,17 @@ def main():
     if os.path.isfile(path):
         process_file(path, new_order)
     elif os.path.isdir(path):
-        for dirpath, _, filenames in os.walk(path):
-            if 'POSCAR' in filenames:
-                file_path = os.path.join(dirpath, 'POSCAR')
-                process_file(file_path, new_order)
+        structure_files = collect_structure_files(path)
+        if not structure_files:
+            print(
+                f"No structure files found in '{path}'. "
+                "Expected files named POSCAR or with a .vasp extension.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print(f"Found {len(structure_files)} structure file(s) to process")
+        for file_path in structure_files:
+            process_file(file_path, new_order)
     else:
         print(f"Error: The path '{path}' does not exist or is not a valid file/directory.", file=sys.stderr)
         sys.exit(1)
