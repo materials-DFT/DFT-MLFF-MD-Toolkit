@@ -178,11 +178,9 @@ def setup_single_point_dft(
     validate_source_layout(source, prune_nested=prune_nested, dry_run=dry_run)
 
     template = Path(template_dir).resolve() if template_dir else TEMPLATE_DIR
-    potcar_template = template / "POTCAR"
     submit_template = template / "submit.vasp6.sh"
-    for name, path in [("POTCAR", potcar_template), ("submit.vasp6.sh", submit_template)]:
-        if not path.is_file():
-            raise SystemExit(f"Error: template file not found: {path}")
+    if not submit_template.is_file():
+        raise SystemExit(f"Error: template file not found: {submit_template}")
 
     vasp_files = top_level_vasp_files(source)
     if not vasp_files:
@@ -250,7 +248,6 @@ def setup_single_point_dft(
         write(str(poscar_path), atoms, format="vasp", vasp5=True, sort=True, direct=False)
         write_incar(dest / "INCAR", system_name, magmom)
         write_kpoints(dest / "KPOINTS")
-        shutil.copy2(potcar_template, dest / "POTCAR")
         shutil.copy2(submit_template, dest / "submit.vasp6.sh")
         vasp_file.unlink()
 
@@ -281,7 +278,7 @@ def main():
     )
     parser.add_argument(
         "--template-dir",
-        help="Directory with template POTCAR and submit.vasp6.sh "
+        help="Directory with template submit.vasp6.sh "
              f"(default: {TEMPLATE_DIR})",
     )
     parser.add_argument("--dry-run", action="store_true", help="Show planned directories only")
