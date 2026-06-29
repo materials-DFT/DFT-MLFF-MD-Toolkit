@@ -12,9 +12,6 @@ from pathlib import Path
 
 from ase.io import read, write
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-TEMPLATE_DIR = SCRIPT_DIR / "delta_npt_frames" / "frame_0000_K24Mn32O64"
-
 MAGMOM_MAP = {"Mn": 3.0}
 DEFAULT_MAGMOM = 0.0
 
@@ -159,7 +156,6 @@ def validate_source_layout(source: Path, prune_nested: bool = False, dry_run: bo
 
 def setup_single_point_dft(
     source_dir,
-    template_dir=None,
     dry_run=False,
     wrap=True,
     limit=None,
@@ -176,11 +172,6 @@ def setup_single_point_dft(
         )
 
     validate_source_layout(source, prune_nested=prune_nested, dry_run=dry_run)
-
-    template = Path(template_dir).resolve() if template_dir else TEMPLATE_DIR
-    submit_template = template / "submit.vasp6.sh"
-    if not submit_template.is_file():
-        raise SystemExit(f"Error: template file not found: {submit_template}")
 
     vasp_files = top_level_vasp_files(source)
     if not vasp_files:
@@ -248,7 +239,6 @@ def setup_single_point_dft(
         write(str(poscar_path), atoms, format="vasp", vasp5=True, sort=True, direct=False)
         write_incar(dest / "INCAR", system_name, magmom)
         write_kpoints(dest / "KPOINTS")
-        shutil.copy2(submit_template, dest / "submit.vasp6.sh")
         vasp_file.unlink()
 
         created += 1
@@ -276,11 +266,6 @@ def main():
         "directory",
         help="Directory containing top-level .vasp files",
     )
-    parser.add_argument(
-        "--template-dir",
-        help="Directory with template submit.vasp6.sh "
-             f"(default: {TEMPLATE_DIR})",
-    )
     parser.add_argument("--dry-run", action="store_true", help="Show planned directories only")
     parser.add_argument("--no-wrap", action="store_true", help="Do not wrap atoms into the cell")
     parser.add_argument("--limit", type=int, help="Process only the first N .vasp files")
@@ -293,7 +278,6 @@ def main():
 
     setup_single_point_dft(
         args.directory,
-        template_dir=args.template_dir,
         dry_run=args.dry_run,
         wrap=not args.no_wrap,
         limit=args.limit,
