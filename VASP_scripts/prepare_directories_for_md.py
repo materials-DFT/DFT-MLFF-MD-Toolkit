@@ -40,8 +40,8 @@ Examples:
     # VASP NVT
     python3 prepare_directories_for_md.py /path/to/structures --nvt --temps 300,700
 
-    # LAMMPS NPT
-    python3 prepare_directories_for_md.py /path/to/structures --lammps --temps 300,700
+    # LAMMPS NPT (temperature from directory name when present, e.g. 700K/)
+    python3 prepare_directories_for_md.py /path/to/NPT --lammps
 
     # LAMMPS NVT
     python3 prepare_directories_for_md.py /path/to/structures --lammps --nvt --temps 300,700
@@ -304,6 +304,12 @@ class MDDirectoryProcessor:
             if t:
                 temps.append(int(t))
         return temps
+
+    @staticmethod
+    def parse_temperature_from_dirname(path: str) -> Optional[int]:
+        """Extract target temperature from a directory name like 300K or 700k."""
+        match = re.fullmatch(r"(\d+)K", os.path.basename(path), re.IGNORECASE)
+        return int(match.group(1)) if match else None
     
     def is_structure_dir(self, path: str) -> bool:
         """Check if directory contains structure files."""
@@ -1018,8 +1024,7 @@ thermo_modify flush yes
     ) -> Dict[str, Any]:
         """Process a single structure directory."""
         struct_path = os.path.abspath(struct_path)
-        temp_dir_match = re.fullmatch(r"(\d+)K", os.path.basename(struct_path))
-        in_place_temp = int(temp_dir_match.group(1)) if temp_dir_match else None
+        in_place_temp = self.parse_temperature_from_dirname(struct_path)
         
         try:
             entries = os.listdir(struct_path)
@@ -1099,10 +1104,13 @@ thermo_modify flush yes
             'system_info': system_info
         }
         
-        # For LAMMPS: always update in place, no temperature subdirectories
-        # For VASP: create temperature subdirectories unless already in a temp dir
+        # LAMMPS: update in place (no temp subdirs). Prefer temperature from dir name (e.g. 700K).
+        # VASP: create temperature subdirectories unless already in a temp-named dir.
         if effective_code == "lammps":
-            target_temperatures = temperatures[:1] if temperatures else [300]  # Use first temp
+            if in_place_temp is not None:
+                target_temperatures = [in_place_temp]
+            else:
+                target_temperatures = temperatures[:1] if temperatures else [300]
             in_place_mode = True
         else:
             target_temperatures = [in_place_temp] if in_place_temp is not None else temperatures

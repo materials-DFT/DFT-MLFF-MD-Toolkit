@@ -4,6 +4,9 @@
 Each argument must be a directory tree to search. Under each tree, any OUTCAR
 is treated as VASP and any log.lammps as LAMMPS (both may appear in the same tree).
 
+Series whose path labels contain a temperature tag (e.g. 300K, 700K) are grouped
+into separate subplots, one panel per temperature.
+
 The figure is shown with matplotlib's default GUI backend (on Linux, typically
 Tk/Qt drawing to the X11/Wayland display referenced by DISPLAY—e.g. ssh -X).
 """
@@ -22,6 +25,7 @@ VASP_VOLUME_RE = re.compile(
     r"volume\s+of\s+cell\s*:\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)",
     re.IGNORECASE,
 )
+TEMP_RE = re.compile(r"(\d+)\s*K", re.IGNORECASE)
 
 
 class VolumeSeries(NamedTuple):
@@ -152,18 +156,93 @@ def parse_lammps_root(root: Path) -> list[VolumeSeries]:
     return series
 
 
-def plot_series(all_series: Iterable[VolumeSeries]) -> None:
-    fig, ax = plt.subplots(figsize=(10, 5))
-    for s in all_series:
+def extract_temperature(label: str) -> str | None:
+    """Return e.g. '300K' when the series path label contains a temperature tag."""
+    m = TEMP_RE.search(label)
+    return f"{m.group(1)}K" if m else None
+
+
+def _temperature_sort_key(temp: str) -> int:
+    m = re.match(r"(\d+)K", temp, re.IGNORECASE)
+    return int(m.group(1)) if m else 10**9
+
+
+def _legend_label(label: str, temp: str | None) -> str:
+    """Drop redundant temperature from legend when it is in the subplot title."""
+    if temp:
+        for variant in (f" ({temp})", f"({temp})"):
+            if variant in label:
+                return label.replace(variant, "").strip()
+    if label.startswith("LAMMPS"):
+        return "LAMMPS"
+    if label.startswith("VASP"):
+        return "VASP"
+    return label
+
+
+def _plot_on_axes(
+    ax: plt.Axes,
+    series: Iterable[VolumeSeries],
+    *,
+    title: str,
+    temp: str | None = None,
+) -> None:
+    for s in series:
         if not s.volumes:
             continue
-        ax.plot(s.steps, s.volumes, label=s.label, linewidth=0.8, alpha=0.9)
+        ax.plot(
+            s.steps,
+            s.volumes,
+            label=_legend_label(s.label, temp),
+            linewidth=0.8,
+            alpha=0.9,
+        )
 
     ax.set_xlabel("Step (LAMMPS: MD step; VASP: sequential volume sample index)")
     ax.set_ylabel(r"Cell volume ($\mathrm{\AA}^3$)")
-    ax.set_title("NPT / MD cell volume")
+    ax.set_title(title)
     ax.legend(loc="best", fontsize=8)
     ax.grid(True, alpha=0.3)
+
+
+def plot_series(all_series: Iterable[VolumeSeries]) -> None:
+    series_list = [s for s in all_series if s.volumes]
+    if not series_list:
+        return
+
+    by_temp: dict[str | None, list[VolumeSeries]] = {}
+    for s in series_list:
+        by_temp.setdefault(extract_temperature(s.label), []).append(s)
+
+    temps = sorted((t for t in by_temp if t is not None), key=_temperature_sort_key)
+    other = by_temp.get(None, [])
+
+    if not temps:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        _plot_on_axes(ax, series_list, title="NPT / MD cell volume")
+        fig.tight_layout()
+        plt.show()
+        return
+
+    n_panels = len(temps) + (1 if other else 0)
+    fig, axes = plt.subplots(n_panels, 1, figsize=(10, 4.5 * n_panels), squeeze=False)
+    panel_axes = list(axes[:, 0])
+
+    for ax, temp in zip(panel_axes, temps):
+        _plot_on_axes(
+            ax,
+            by_temp[temp],
+            title=f"NPT / MD cell volume — {temp}",
+            temp=temp,
+        )
+
+    if other:
+        _plot_on_axes(
+            panel_axes[-1],
+            other,
+            title="NPT / MD cell volume (no temperature tag)",
+        )
+
     fig.tight_layout()
     plt.show()
 
