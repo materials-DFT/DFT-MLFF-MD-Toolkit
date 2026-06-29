@@ -1,125 +1,47 @@
 #!/usr/bin/env python3
-"""
-Script to organize POSCAR files into directories for DFT calculations.
-For files like POSCAR.alpha_oms6_111_111_8.92b3d235-d5e9-4086-99f6-97dda8b0ecc6
-Creates directory: alpha_oms6_111_111_8
-Moves and renames file to: alpha_oms6_111_111_8/POSCAR
+"""Create one VASP single-point directory per top-level .vasp file.
+
+Each input file `foo.vasp` becomes exactly one directory `foo/` containing
+`POSCAR` (converted from the .vasp). The original .vasp is removed.
 """
 
 import argparse
-import os
-import re
 import shutil
+from collections import Counter
 from pathlib import Path
 
+from ase.io import read, write
 
-def extract_interface_name(filename):
-    """
-    Extract interface name from POSCAR filename.
-    
-    Example: POSCAR.alpha_oms6_111_111_8.92b3d235-d5e9-4086-99f6-97dda8b0ecc6
-    Returns: alpha_oms6_111_111_8
-    """
-    # Remove 'POSCAR.' prefix
-    if not filename.startswith('POSCAR.'):
-        return None
-    
-    # Extract everything after 'POSCAR.' and before the last dot (UUID)
-    match = re.match(r'^POSCAR\.(.+)\.[^.]*$', filename)
-    if match:
-        return match.group(1)
-    return None
+SCRIPT_DIR = Path(__file__).resolve().parent
+TEMPLATE_DIR = SCRIPT_DIR / "delta_npt_frames" / "frame_0000_K24Mn32O64"
+
+MAGMOM_MAP = {"Mn": 3.0}
+DEFAULT_MAGMOM = 0.0
 
 
-def parse_poscar(poscar_path):
-    """
-    Parse POSCAR file to extract system name, elements, and atom counts.
-    
-    POSCAR format:
-    Line 1: System name (or element names)
-    Line 2: Scaling factor
-    Lines 3-5: Lattice vectors
-    Line 6: Element names
-    Line 7: Atom counts
-    
-    Returns:
-        tuple: (system_name, elements, atom_counts)
-    """
-    with open(poscar_path, 'r') as f:
-        lines = [line.strip() for line in f.readlines() if line.strip()]
-    
-    # System name is first line
-    system_name = lines[0]
-    
-    # Skip scaling factor (line 2) and lattice vectors (lines 3-5)
-    # Start searching from line 6 (index 5)
-    elements = None
-    atom_counts = None
-    
-    # Find element names line (should be after lattice vectors)
-    # Look for a line that contains only element symbols
-    for i in range(5, min(len(lines), 10)):  # Check lines 6-10
-        line = lines[i]
-        # Check if line contains only element symbols (uppercase letter followed by optional lowercase)
-        if re.match(r'^[A-Z][a-z]?(\s+[A-Z][a-z]?)*\s*$', line):
-            elements = line.split()
-            # Next line should have atom counts (integers only)
-            if i + 1 < len(lines):
-                try:
-                    atom_counts = [int(x) for x in lines[i + 1].split()]
-                    break
-                except ValueError:
-                    # If next line doesn't contain integers, continue searching
-                    continue
-    
-    if not elements or not atom_counts:
-        raise ValueError(f"Could not parse POSCAR file: {poscar_path}")
-    
-    return system_name, elements, atom_counts
+def generate_magmom(symbols, counts):
+    parts = []
+    for symbol, count in zip(symbols, counts):
+        mag = MAGMOM_MAP.get(symbol, DEFAULT_MAGMOM)
+        parts.append(f"{count}*{mag:g}")
+    return " ".join(parts)
 
 
-def generate_magmom(elements, atom_counts):
-    """
-    Generate MAGMOM string based on elements and atom counts.
-    K gets 0.0, Mn gets 3.0, O gets 0.0
-    
-    Args:
-        elements: List of element symbols
-        atom_counts: List of atom counts for each element
-    
-    Returns:
-        str: MAGMOM string
-    """
-    magmom_parts = []
-    
-    for element, count in zip(elements, atom_counts):
-        if element == 'Mn':
-            magmom = 3.0
-        else:
-            magmom = 0.0
-        
-        magmom_parts.append(f"{count}*{magmom:.1f}")
-    
-    return ' '.join(magmom_parts)
+def get_element_counts(atoms):
+    counter = Counter(atoms.get_chemical_symbols())
+    symbols = sorted(counter.keys())
+    return symbols, [counter[s] for s in symbols]
 
 
-def write_incar(incar_path, system_name, magmom):
-    """
-    Write INCAR file with the provided template.
-    
-    Args:
-        incar_path: Path to write INCAR file
-        system_name: System name from POSCAR
-        magmom: MAGMOM string
-    """
-    incar_content = f"""System = {system_name}
+def write_incar(path, system_name, magmom):
+    content = f"""System = {system_name} single-point
 
-Starting parameters for this run:
+Starting parameters:
 ISTART = 0
 ICHARG = 2
 
-Electronic Relaxtion:
-PREC = Normal
+Electronic Relaxation:
+PREC = Accurate
 ENCUT = 520
 NELMIN = 6
 NELM = 500
@@ -127,242 +49,260 @@ EDIFF = 1E-6
 LREAL = .FALSE.
 ISPIN = 2
 MAGMOM = {magmom}
-#LNONCOLLINEAR = .TRUE.
-ALGO = Fast
-#LDAU = .TRUE.
-#LDAUTYPE = 4
-#LDAUL = -1 -1 2 -1
-#LDAUU = 0 0 5.5 0 
-#LDAUJ = 0 0 0 0 
-#LMAXMIX = 4
-#AMIX = 0.2
-#BMIX = 0.0001
-#LHFCALC = .TRUE.
-#GGA = PE
+ALGO = All
+
 METAGGA = SCAN
-LMIXTAU=.TRUE.
-LASPH=.TRUE.
-LDIAG=.TRUE.
+LMIXTAU = .TRUE.
+LASPH = .TRUE.
+LDIAG = .TRUE.
 
-Ionic Molecular Dynamics:
-# NSW = 1000  max number of geometry steps
-IBRION = -1  ionic relax: 0-MD, 1-quasi-Newton, 2-CG, 3-Damped MD
-# EDIFFG =  -5E-02  force (eV/A) stopping-criterion for geometry steps
-# ISIF   =  3  (1:force=y stress=trace only ions=y shape=n volume=n)
-# POTIM = 0.5 initial time step for geo-opt (increase for soft sys)
+Single-point (no ionic relaxation):
+# NSW = 0
+IBRION = -1
+# ISIF = 2
+ISYM = 0
 
-DOS related values:
-LORBIT =     10        
-# NEDOS  =     1501
-# EMIN   =    -20.0
-# EMAX   =     10.0
-ISMEAR =  0  (-1-Fermi, 1-Methfessel/Paxton)
-SIGMA  =  0.05   broadening in eV
+DOS related:
+LORBIT = 10
+ISMEAR = 0
+SIGMA = 0.05
 
-Parallelization flags:
-NCORE = 4
+Parallelization:
+NCORE = 8
 NSIM = 4
 LPLANE = .TRUE.
 LSCALU = .FALSE.
 KPAR = 1
-# LSCALAPACK = .FALSE.
-# ISYM = 0 
-# ADDGRID = .TRUE. 
 
-# Space-saving flags (appended by script)
-LWAVE  = .FALSE.
+IO Control:
+LWAVE = .FALSE.
 LCHARG = .FALSE.
 """
-    
-    with open(incar_path, 'w') as f:
-        f.write(incar_content)
+    path.write_text(content)
 
 
-def write_kpoints(kpoints_path):
-    """
-    Write KPOINTS file with Gamma point.
-    
-    Args:
-        kpoints_path: Path to write KPOINTS file
-    """
-    kpoints_content = """Gamma KPOINTS
-0
-Monkhorst-Pack
-1 1 1
-0 0 0
-"""
-    
-    with open(kpoints_path, 'w') as f:
-        f.write(kpoints_content)
+def write_kpoints(path):
+    path.write_text(
+        "Gamma-only\n"
+        "0\n"
+        "Gamma\n"
+        "1 1 1\n"
+        "0 0 0\n"
+    )
 
 
-def regenerate_files_for_existing_dirs(target_dir):
-    """
-    Regenerate INCAR, KPOINTS files for existing directories that contain POSCAR.
-    
-    Args:
-        target_dir: Path to directory containing interface directories
-    """
-    target_path = Path(target_dir).resolve()
-    
-    # Check if directory exists
-    if not target_path.is_dir():
-        print(f"Error: Directory '{target_dir}' does not exist")
-        return 1
-    
-    # Find all directories containing POSCAR files recursively
-    poscar_dirs = []
-    for poscar_file in target_path.rglob('POSCAR'):
-        # Only process POSCAR files that are directly in their directory (not POSCAR.*.*)
-        if poscar_file.name == 'POSCAR' and poscar_file.parent != target_path:
-            poscar_dirs.append(poscar_file.parent)
-    
-    if not poscar_dirs:
-        print(f"No directories with POSCAR files found in '{target_dir}'")
-        return 0
-    
-    count = 0
-    
-    for interface_dir in poscar_dirs:
-        poscar_file = interface_dir / 'POSCAR'
-        
-        # Parse POSCAR to get system info
-        try:
-            poscar_system_name, elements, atom_counts = parse_poscar(poscar_file)
-            magmom = generate_magmom(elements, atom_counts)
-            # Generate system formula from elements and counts
-            system_name = ''.join(f"{elem}{count}" for elem, count in zip(elements, atom_counts))
-        except Exception as e:
-            print(f"Warning: Could not parse POSCAR '{poscar_file}': {e}, skipping...")
+def top_level_vasp_files(source: Path) -> list[Path]:
+    """Return only direct-child .vasp files, never nested ones."""
+    return sorted(
+        p for p in source.iterdir()
+        if p.is_file() and p.suffix == ".vasp"
+    )
+
+
+def nested_vasp_files(source: Path) -> list[Path]:
+    return [
+        p for p in source.rglob("*.vasp")
+        if p.parent != source
+    ]
+
+
+def nested_calc_dirs(source: Path) -> list[Path]:
+    """Directories below the first level (erroneous nested calc dirs)."""
+    nested = []
+    for path in source.iterdir():
+        if not path.is_dir():
             continue
-        
-        # Regenerate INCAR file
-        if system_name and magmom:
-            incar_path = interface_dir / 'INCAR'
-            write_incar(incar_path, system_name, magmom)
-        
-        # Regenerate KPOINTS file
-        kpoints_path = interface_dir / 'KPOINTS'
-        write_kpoints(kpoints_path)
-        
-        # Show relative path from target directory
-        rel_path = interface_dir.relative_to(target_path)
-        print(f"Regenerated: {rel_path}")
-        if system_name:
-            print(f"  Updated INCAR and KPOINTS (System: {system_name}, MAGMOM: {magmom})")
-        count += 1
-    
-    print(f"\nDone! Regenerated files for {count} directories.")
-    return 0
+        for child in path.rglob("*"):
+            if child.is_dir() and child != path:
+                nested.append(child)
+    return sorted(nested)
 
 
-def setup_dft_directories(target_dir, regenerate=False):
-    """
-    Organize POSCAR files into directories based on interface names.
-    
-    Args:
-        target_dir: Path to directory containing POSCAR files
-        regenerate: If True, regenerate files for existing directories instead of processing new POSCAR files
-    """
-    if regenerate:
-        return regenerate_files_for_existing_dirs(target_dir)
-    
-    target_path = Path(target_dir).resolve()
-    
-    # Check if directory exists
-    if not target_path.is_dir():
-        print(f"Error: Directory '{target_dir}' does not exist")
-        return 1
-    
-    # Change to target directory
-    os.chdir(target_path)
-    
-    # Find all POSCAR files matching the pattern POSCAR.*.* recursively
-    poscar_files = list(target_path.rglob('POSCAR.*.*'))
-    
-    if not poscar_files:
-        print(f"No POSCAR files matching pattern 'POSCAR.*.*' found in '{target_dir}' (searched recursively)")
-        return 0
-    
-    count = 0
-    
-    # Process each POSCAR file
-    for poscar_file in poscar_files:
-        filename = poscar_file.name
-        
-        # Extract interface name
-        interface_name = extract_interface_name(filename)
-        
-        if not interface_name:
-            print(f"Warning: Could not extract interface name from '{filename}', skipping...")
+def prune_nested_dirs(source: Path, dry_run: bool = False) -> int:
+    removed = 0
+    for path in sorted(nested_calc_dirs(source), key=lambda p: len(p.parts), reverse=True):
+        if dry_run:
+            print(f"Would remove nested directory: {path.relative_to(source)}")
+        else:
+            shutil.rmtree(path)
+            print(f"Removed nested directory: {path.relative_to(source)}")
+        removed += 1
+    return removed
+
+
+def validate_source_layout(source: Path, prune_nested: bool = False, dry_run: bool = False):
+    nested_vasps = nested_vasp_files(source)
+    if nested_vasps:
+        examples = ", ".join(str(p.relative_to(source)) for p in nested_vasps[:5])
+        raise SystemExit(
+            "Error: found .vasp files inside calculation subdirectories. "
+            "Only top-level .vasp files are supported.\n"
+            f"Examples: {examples}\n"
+            "This usually means the setup script was re-run recursively and created "
+            "nested directories. Remove nested .vasp files or use --prune-nested-dirs "
+            "after backing up anything important."
+        )
+
+    nested_dirs = nested_calc_dirs(source)
+    if nested_dirs:
+        if not prune_nested:
+            examples = ", ".join(str(p.relative_to(source)) for p in nested_dirs[:5])
+            raise SystemExit(
+                "Error: found nested calculation directories below the top level.\n"
+                f"Examples: {examples}\n"
+                "Re-run with --prune-nested-dirs to remove them, or clean up manually."
+            )
+        removed = prune_nested_dirs(source, dry_run=dry_run)
+        print(f"{'Would remove' if dry_run else 'Removed'} {removed} nested director"
+              f"{'y' if removed == 1 else 'ies'}.")
+
+
+def setup_single_point_dft(
+    source_dir,
+    template_dir=None,
+    dry_run=False,
+    wrap=True,
+    limit=None,
+    prune_nested=False,
+):
+    source = Path(source_dir).resolve()
+    if not source.is_dir():
+        raise SystemExit(f"Error: '{source_dir}' is not a directory")
+
+    if (source / "POSCAR").is_file() and (source / "INCAR").is_file():
+        raise SystemExit(
+            f"Error: '{source}' already looks like a VASP calculation directory. "
+            "Pass the directory that contains .vasp files, not an individual calculation."
+        )
+
+    validate_source_layout(source, prune_nested=prune_nested, dry_run=dry_run)
+
+    template = Path(template_dir).resolve() if template_dir else TEMPLATE_DIR
+    potcar_template = template / "POTCAR"
+    submit_template = template / "submit.vasp6.sh"
+    for name, path in [("POTCAR", potcar_template), ("submit.vasp6.sh", submit_template)]:
+        if not path.is_file():
+            raise SystemExit(f"Error: template file not found: {path}")
+
+    vasp_files = top_level_vasp_files(source)
+    if not vasp_files:
+        existing = sum(1 for p in source.iterdir() if p.is_dir() and (p / "POSCAR").is_file())
+        if existing:
+            print(f"No top-level .vasp files found. {existing} calculation director"
+                  f"{'y' if existing == 1 else 'ies'} already present under {source}")
+            return
+        raise SystemExit(f"No top-level .vasp files found in '{source}'")
+
+    if limit is not None:
+        vasp_files = vasp_files[:limit]
+
+    created = 0
+    cleaned = 0
+    skipped = 0
+
+    for vasp_file in vasp_files:
+        dest = source / vasp_file.stem
+        if dest.parent != source:
+            raise SystemExit(f"Internal error: destination is not a direct child: {dest}")
+
+        poscar_path = dest / "POSCAR"
+
+        if dest.is_dir() and poscar_path.is_file():
+            skipped += 1
+            if vasp_file.exists():
+                if dry_run:
+                    print(f"Would remove duplicate top-level file: {vasp_file.name}")
+                else:
+                    vasp_file.unlink()
+                    cleaned += 1
             continue
-        
-        # Create directory in the same location as the POSCAR file
-        interface_dir = poscar_file.parent / interface_name
-        interface_dir.mkdir(exist_ok=True)
-        
-        # Move and rename the file
-        destination = interface_dir / 'POSCAR'
-        shutil.move(str(poscar_file), str(destination))
-        
-        # Parse POSCAR to get system info
-        try:
-            poscar_system_name, elements, atom_counts = parse_poscar(destination)
-            magmom = generate_magmom(elements, atom_counts)
-            # Generate system formula from elements and counts
-            system_name = ''.join(f"{elem}{count}" for elem, count in zip(elements, atom_counts))
-        except Exception as e:
-            print(f"Warning: Could not parse POSCAR '{destination}': {e}, skipping INCAR/KPOINTS generation")
-            system_name = None
-            magmom = None
-        
-        # Write INCAR file
-        if system_name and magmom:
-            incar_path = interface_dir / 'INCAR'
-            write_incar(incar_path, system_name, magmom)
-        
-        # Write KPOINTS file
-        kpoints_path = interface_dir / 'KPOINTS'
-        write_kpoints(kpoints_path)
-        
-        # Show relative path from target directory
-        rel_path = poscar_file.relative_to(target_path)
-        print(f"Processed: {rel_path} -> {rel_path.parent / interface_name / 'POSCAR'}")
-        if system_name:
-            print(f"  Created INCAR and KPOINTS (System: {system_name}, MAGMOM: {magmom})")
-        count += 1
-    
-    print(f"\nDone! Processed {count} POSCAR files.")
-    return 0
+
+        if dest.exists():
+            raise SystemExit(
+                f"Error: {dest.relative_to(source)} exists but has no POSCAR; "
+                f"refusing to overwrite while processing {vasp_file.name}"
+            )
+
+        atoms = read(str(vasp_file), format="vasp")
+        frames = atoms if isinstance(atoms, list) else [atoms]
+        if len(frames) != 1:
+            raise SystemExit(
+                f"Error: {vasp_file.name} contains {len(frames)} structures. "
+                "Expected exactly one structure per .vasp file."
+            )
+        atoms = frames[0]
+        if wrap:
+            atoms.wrap()
+
+        symbols, counts = get_element_counts(atoms)
+        system_name = "".join(f"{sym}{count}" for sym, count in zip(symbols, counts))
+        magmom = generate_magmom(symbols, counts)
+
+        if dry_run:
+            print(
+                f"Would create: {dest.name}/  "
+                f"({system_name}, {len(atoms)} atoms) from {vasp_file.name}"
+            )
+            created += 1
+            continue
+
+        dest.mkdir(parents=False, exist_ok=False)
+        write(str(poscar_path), atoms, format="vasp", vasp5=True, sort=True, direct=False)
+        write_incar(dest / "INCAR", system_name, magmom)
+        write_kpoints(dest / "KPOINTS")
+        shutil.copy2(potcar_template, dest / "POTCAR")
+        shutil.copy2(submit_template, dest / "submit.vasp6.sh")
+        vasp_file.unlink()
+
+        created += 1
+        if created % 50 == 0:
+            print(f"  Created {created}/{len(vasp_files)} directories...")
+
+    print(f"\nDone! Created {created} director{'y' if created == 1 else 'ies'} under {source}")
+    if skipped:
+        print(f"Skipped {skipped} already-converted director{'y' if skipped == 1 else 'ies'}")
+    if cleaned:
+        print(f"Removed {cleaned} duplicate top-level .vasp file(s)")
+    print(f"Top-level calculation directories: "
+          f"{sum(1 for p in source.iterdir() if p.is_dir() and (p / 'POSCAR').is_file())}")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Organize POSCAR files into directories for DFT calculations (searches recursively)',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Example:
-  %(prog)s ./interfaces/phase_oms6
-  %(prog)s ./interfaces/phase_oms6/oms6_1k/unique_poscars
-        """
+        description="Create exactly one VASP directory per top-level .vasp file.",
+        epilog=(
+            "Each foo.vasp becomes foo/POSCAR. Nested .vasp processing is intentionally "
+            "disabled to avoid multiplying directories on repeated runs."
+        ),
     )
     parser.add_argument(
-        'directory',
-        help='Path to directory containing POSCAR files (searched recursively)'
+        "directory",
+        help="Directory containing top-level .vasp files",
     )
     parser.add_argument(
-        '--regenerate',
-        action='store_true',
-        help='Regenerate INCAR and KPOINTS files for existing directories containing POSCAR files. '
-             'Use this to update files (e.g., fix blank lines in INCAR) without reprocessing POSCAR files.'
+        "--template-dir",
+        help="Directory with template POTCAR and submit.vasp6.sh "
+             f"(default: {TEMPLATE_DIR})",
     )
-    
+    parser.add_argument("--dry-run", action="store_true", help="Show planned directories only")
+    parser.add_argument("--no-wrap", action="store_true", help="Do not wrap atoms into the cell")
+    parser.add_argument("--limit", type=int, help="Process only the first N .vasp files")
+    parser.add_argument(
+        "--prune-nested-dirs",
+        action="store_true",
+        help="Remove erroneously nested subdirectories before processing",
+    )
     args = parser.parse_args()
-    
-    exit_code = setup_dft_directories(args.directory, regenerate=args.regenerate)
-    exit(exit_code)
+
+    setup_single_point_dft(
+        args.directory,
+        template_dir=args.template_dir,
+        dry_run=args.dry_run,
+        wrap=not args.no_wrap,
+        limit=args.limit,
+        prune_nested=args.prune_nested_dirs,
+    )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
-
