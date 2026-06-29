@@ -8,9 +8,12 @@
 #SBATCH --gres=gpu:1
 
 # Unified evaluation script for MACE and Allegro (NequIP) models.
-# No flags required: run from the directory where you submit (e.g. sbatch eval_configs.sh).
-# Autodetects backend by model file in that directory: .model → MACE, .ckpt → Allegro.
-# Expects one .xyz (configs) and one model file (.model or .ckpt) in the same directory.
+# Run from the evaluation directory, or pass it as the first argument:
+#   sbatch eval_configs.sh
+#   sbatch eval_configs.sh .
+#   sbatch eval_configs.sh path/to/high_forces
+# Autodetects backend by model file: .model → MACE, .ckpt → Allegro.
+# Expects one .xyz (configs) in the work directory; model may be local or in a parent models/ dir.
 
 set -euo pipefail
 
@@ -20,24 +23,22 @@ set +u
 eval "$($HOME/miniconda3/bin/conda shell.bash hook)"
 set -u
 
-# ===== Move to submit directory =====
-cd "${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
-
 usage() {
   cat <<'USAGE'
 Usage:
-  sbatch eval_configs.sh
+  sbatch eval_configs.sh [WORK_DIR]
 
-No flags required. From the directory where you submit:
-  - Put exactly one .xyz file (structures to evaluate).
-  - Put exactly one model file: .model for MACE, .ckpt for Allegro.
-  - Backend is auto-detected from the model extension.
+WORK_DIR defaults to the directory where you run sbatch (SLURM_SUBMIT_DIR).
+  - Put exactly one .xyz file (structures to evaluate) in WORK_DIR.
+  - Put one model file in WORK_DIR, or Allegro best.ckpt/last.ckpt in a parent models/ dir.
+  - Backend is auto-detected from the model extension (.model → MACE, .ckpt → Allegro).
   - Optional: -m/--model FILE, -c/--configs FILE, -h/--help.
 USAGE
 }
 
 MODEL_FILE=""
 CONFIGS_FILE=""
+WORK_DIR=""
 
 # ===== Optional args (overrides; not required) =====
 while [[ $# -gt 0 ]]; do
@@ -50,10 +51,50 @@ while [[ $# -gt 0 ]]; do
       CONFIGS_FILE="$2"; shift 2;;
     -h|--help)
       usage; exit 0;;
+    -*)
+      echo "Error: Unknown option: $1"; usage; exit 2;;
     *)
-      shift;;
+      if [[ -n "$WORK_DIR" ]]; then
+        echo "Error: Unexpected extra argument: $1"; usage; exit 2
+      fi
+      WORK_DIR="$1"; shift;;
   esac
 done
+
+# ===== Move to work directory =====
+if [[ -z "$WORK_DIR" ]]; then
+  WORK_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+fi
+if [[ ! -d "$WORK_DIR" ]]; then
+  echo "❌ Error: Work directory not found: $WORK_DIR"
+  exit 1
+fi
+cd "$WORK_DIR"
+echo "✅ Work directory: $(pwd)"
+
+find_allegro_model_in_parents() {
+  local dir="$1"
+  local depth=0
+  while [[ $depth -lt 12 && "$dir" != "/" ]]; do
+    if [[ -f "$dir/models/best.ckpt" ]]; then
+      echo "$dir/models/best.ckpt"
+      return 0
+    fi
+    dir="$(dirname "$dir")"
+    depth=$((depth + 1))
+  done
+  dir="$1"
+  depth=0
+  while [[ $depth -lt 12 && "$dir" != "/" ]]; do
+    if [[ -f "$dir/models/last.ckpt" ]]; then
+      echo "$dir/models/last.ckpt"
+      return 0
+    fi
+    dir="$(dirname "$dir")"
+    depth=$((depth + 1))
+  done
+  return 1
+}
 
 # ===== Autodetect CONFIGS_FILE: single .xyz in submit directory =====
 # Ignore output.xyz — it is written by this script; a leftover file must not count as a second input.
@@ -107,17 +148,11 @@ if [[ -z "${MODEL_FILE}" ]]; then
     printf '  %s\n' "${CKPT_FILES[@]}"
     exit 1
   else
-    # No model in cwd: try Allegro-style ../models/best.ckpt or last.ckpt
-    for d in "$(pwd)/../models" "$(pwd)/../../models" "$(pwd)/../../../models"; do
-      [[ -f "$d/best.ckpt" ]] && MODEL_FILE="$d/best.ckpt" && BACKEND="allegro" && break
-    done
-    if [[ -z "$MODEL_FILE" ]]; then
-      for d in "$(pwd)/../models" "$(pwd)/../../models" "$(pwd)/../../../models"; do
-        [[ -f "$d/last.ckpt" ]] && MODEL_FILE="$d/last.ckpt" && BACKEND="allegro" && break
-      done
-    fi
-    if [[ -z "$MODEL_FILE" ]]; then
-      echo "❌ Error: No model in current directory. Put one .model (MACE) or one .ckpt (Allegro) here, or put best.ckpt/last.ckpt in ../models for Allegro."
+    # No model in cwd: walk up to find Allegro-style models/best.ckpt or models/last.ckpt
+    if MODEL_FILE="$(find_allegro_model_in_parents "$(pwd)")"; then
+      BACKEND="allegro"
+    else
+      echo "❌ Error: No model in current directory. Put one .model (MACE) or one .ckpt (Allegro) here, or put best.ckpt/last.ckpt in a parent models/ directory for Allegro."
       exit 1
     fi
   fi
