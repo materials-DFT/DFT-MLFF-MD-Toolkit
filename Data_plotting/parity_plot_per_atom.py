@@ -1,19 +1,64 @@
+#!/usr/bin/env python3
+"""Publication-style parity plots for eval XYZ outputs."""
+
+from __future__ import annotations
+
 import argparse
 import concurrent.futures
+import math
 import os
 import sys
+import tempfile
 import textwrap
+from dataclasses import dataclass
 from pathlib import Path
 
-import matplotlib.pyplot as plt
-import numpy as np
-from ase.io import iread, read
+MPLCONFIGDIR = Path(tempfile.gettempdir()) / "matplotlib-cache"
+MPLCONFIGDIR.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("MPLCONFIGDIR", str(MPLCONFIGDIR))
+
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+from ase.io import iread, read  # noqa: E402
+from matplotlib.ticker import AutoMinorLocator, MaxNLocator  # noqa: E402
+
 
 ML_TYPES = (
     ("MACE", "MACE_energy", "MACE_forces", "MACE_stress"),
     ("ALLEGRO", "ALLEGRO_energy", "ALLEGRO_forces", "ALLEGRO_stress"),
     ("UMA", "UMA_energy", "UMA_forces", "UMA_stress"),
 )
+
+PLOT_COLORS = (
+    "#0072B2",
+    "#D55E00",
+    "#009E73",
+    "#CC79A7",
+    "#E69F00",
+    "#56B4E9",
+    "#000000",
+)
+
+
+@dataclass
+class RunningStats:
+    count: int = 0
+    abs_error_sum: float = 0.0
+    sq_error_sum: float = 0.0
+
+    def update(self, reference: np.ndarray, prediction: np.ndarray) -> None:
+        diff = np.asarray(prediction, dtype=float) - np.asarray(reference, dtype=float)
+        self.count += int(diff.size)
+        self.abs_error_sum += float(np.sum(np.abs(diff)))
+        self.sq_error_sum += float(np.sum(diff * diff))
+
+    @property
+    def mae(self) -> float:
+        return self.abs_error_sum / self.count if self.count else math.nan
+
+    @property
+    def rmse(self) -> float:
+        return math.sqrt(self.sq_error_sum / self.count) if self.count else math.nan
 
 
 def detect_mlip(info):
@@ -57,7 +102,7 @@ def discover_eval_xyzs(paths):
 
 
 def label_from_path(xyz_path):
-    """Short label: up to three parent directory names above the XYZ's folder (outer → inner)."""
+    """Short label: up to three parent directory names above the XYZ's folder (outer -> inner)."""
     resolved = xyz_path.resolve()
     names = []
     cur = resolved.parent
@@ -73,9 +118,96 @@ def label_from_path(xyz_path):
     return "/".join(reversed(names))
 
 
+def configure_style() -> None:
+    plt.rcParams.update(
+        {
+            "figure.facecolor": "white",
+            "axes.facecolor": "white",
+            "axes.edgecolor": "#4D4D4D",
+            "axes.labelcolor": "#1F1F1F",
+            "axes.labelsize": 10,
+            "axes.linewidth": 0.9,
+            "axes.titlecolor": "#1F1F1F",
+            "font.family": "DejaVu Sans",
+            "font.size": 10,
+            "legend.fontsize": 8,
+            "xtick.color": "#333333",
+            "xtick.labelsize": 9,
+            "ytick.color": "#333333",
+            "ytick.labelsize": 9,
+        }
+    )
+
+
+def padded_limits(*arrays):
+    valid_arrays = [np.asarray(array, dtype=float).ravel() for array in arrays if np.asarray(array).size]
+    if not valid_arrays:
+        return -1.0, 1.0
+    values = np.concatenate(valid_arrays)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return -1.0, 1.0
+    low = float(np.min(values))
+    high = float(np.max(values))
+    if math.isclose(low, high):
+        pad = max(abs(low) * 0.05, 1.0)
+    else:
+        pad = 0.045 * (high - low)
+    return low - pad, high + pad
+
+
+def aggregate_stats(datasets, key):
+    stats = RunningStats()
+    for dataset in datasets:
+        item = dataset[key]
+        stats.count += item.count
+        stats.abs_error_sum += item.abs_error_sum
+        stats.sq_error_sum += item.sq_error_sum
+    return stats
+
+
+def add_stats_box(axis, stats, unit, extra=""):
+    lines = [
+        f"RMSE = {stats.rmse:.4g} {unit}",
+        f"MAE = {stats.mae:.4g} {unit}",
+        f"N = {stats.count:,}",
+    ]
+    if extra:
+        lines.append(extra)
+    axis.text(
+        0.04,
+        0.96,
+        "\n".join(lines),
+        transform=axis.transAxes,
+        va="top",
+        ha="left",
+        fontsize=8.5,
+        color="#1F1F1F",
+        bbox={
+            "boxstyle": "round,pad=0.35",
+            "facecolor": "white",
+            "edgecolor": "#BDBDBD",
+            "linewidth": 0.8,
+            "alpha": 0.92,
+        },
+    )
+
+
+def finalize_axis(axis):
+    axis.set_aspect("equal", adjustable="box")
+    axis.grid(axis="both", color="#E2E2E2", linewidth=0.75)
+    axis.spines["top"].set_visible(False)
+    axis.spines["right"].set_visible(False)
+    axis.xaxis.set_major_locator(MaxNLocator(nbins=5))
+    axis.yaxis.set_major_locator(MaxNLocator(nbins=5))
+    axis.xaxis.set_minor_locator(AutoMinorLocator())
+    axis.yaxis.set_minor_locator(AutoMinorLocator())
+    axis.tick_params(axis="both", which="major", direction="out", length=4, width=0.8)
+    axis.tick_params(axis="both", which="minor", direction="out", length=2, width=0.6)
+
+
 def load_dataset(xyz_path, forced_ref_index=None):
     iterator = iread(str(xyz_path), index=":")
-    first_frame = None
     try:
         first_frame = next(iterator)
     except StopIteration:
@@ -88,10 +220,8 @@ def load_dataset(xyz_path, forced_ref_index=None):
 
     ml_energies, ref_energies = [], []
     n_atoms = []
-    force_sqerr_sum = 0.0
-    force_count = 0
-    stress_sqerr_sum = 0.0
-    stress_count = 0
+    force_stats = RunningStats()
+    stress_stats = RunningStats()
     ref_forces_plot_chunks = []
     ml_forces_plot_chunks = []
     ref_stresses_plot_chunks = []
@@ -113,6 +243,7 @@ def load_dataset(xyz_path, forced_ref_index=None):
         n_atoms.append(len(frame))
         ml_f = frame.arrays[ml_forces_key].ravel()
         ref_f = frame.arrays["REF_forces"].ravel()
+        force_stats.update(ref_f, ml_f)
         return ml_f, ref_f
 
     def update_plot_buffers(
@@ -140,8 +271,6 @@ def load_dataset(xyz_path, forced_ref_index=None):
 
     # Process first frame then remainder.
     ml_f0, ref_f0 = process_frame(first_frame, 0)
-    force_sqerr_sum += float(np.sum((ml_f0 - ref_f0) ** 2))
-    force_count += int(ml_f0.size)
     force_plot_points = update_plot_buffers(
         ref_f0,
         ml_f0,
@@ -154,8 +283,7 @@ def load_dataset(xyz_path, forced_ref_index=None):
     if ml_stress_key in first_frame.info and "REF_stress" in first_frame.info:
         ml_s0 = np.asarray(first_frame.info[ml_stress_key]).ravel()
         ref_s0 = np.asarray(first_frame.info["REF_stress"]).ravel()
-        stress_sqerr_sum += float(np.sum((ml_s0 - ref_s0) ** 2))
-        stress_count += int(ml_s0.size)
+        stress_stats.update(ref_s0, ml_s0)
         stress_plot_points = update_plot_buffers(
             ref_s0,
             ml_s0,
@@ -168,8 +296,6 @@ def load_dataset(xyz_path, forced_ref_index=None):
 
     for i, frame in enumerate(iterator, start=1):
         ml_f, ref_f = process_frame(frame, i)
-        force_sqerr_sum += float(np.sum((ml_f - ref_f) ** 2))
-        force_count += int(ml_f.size)
         force_plot_points = update_plot_buffers(
             ref_f,
             ml_f,
@@ -182,8 +308,7 @@ def load_dataset(xyz_path, forced_ref_index=None):
         if ml_stress_key in frame.info and "REF_stress" in frame.info:
             ml_s = np.asarray(frame.info[ml_stress_key]).ravel()
             ref_s = np.asarray(frame.info["REF_stress"]).ravel()
-            stress_sqerr_sum += float(np.sum((ml_s - ref_s) ** 2))
-            stress_count += int(ml_s.size)
+            stress_stats.update(ref_s, ml_s)
             stress_plot_points = update_plot_buffers(
                 ref_s,
                 ml_s,
@@ -203,7 +328,7 @@ def load_dataset(xyz_path, forced_ref_index=None):
     else:
         ref_forces_plot = np.empty(0, dtype=float)
         ml_forces_plot = np.empty(0, dtype=float)
-    has_stress = stress_count > 0
+    has_stress = stress_stats.count > 0
     if has_stress:
         if ref_stresses_plot_chunks:
             ref_stresses_plot = np.concatenate(ref_stresses_plot_chunks)
@@ -225,57 +350,31 @@ def load_dataset(xyz_path, forced_ref_index=None):
     else:
         ref_idx = int(np.argmin(ref_per_atom))
 
-    delta_ref_total = ref_energies - ref_energies[ref_idx]
-    delta_ml_total = ml_energies - ml_energies[ref_idx]
     delta_ref_per_atom = ref_per_atom - ref_per_atom[ref_idx]
     delta_ml_per_atom = ml_per_atom - ml_per_atom[ref_idx]
+
+    per_atom_energy_stats = RunningStats()
+    per_atom_energy_stats.update(delta_ref_per_atom, delta_ml_per_atom)
 
     data = {
         "xyz_path": xyz_path,
         "label": label_from_path(xyz_path),
         "ml_label": ml_label,
         "ref_idx": ref_idx,
-        "delta_ref_total": delta_ref_total,
-        "delta_ml_total": delta_ml_total,
+        "n_frames": len(ref_energies),
         "delta_ref_per_atom": delta_ref_per_atom,
         "delta_ml_per_atom": delta_ml_per_atom,
         "ref_forces_plot": ref_forces_plot,
         "ml_forces_plot": ml_forces_plot,
         "has_stress": has_stress,
+        "per_atom_energy_stats": per_atom_energy_stats,
+        "force_stats": force_stats,
+        "stress_stats": stress_stats,
     }
     if has_stress:
         data["ref_stresses_plot"] = ref_stresses_plot
         data["ml_stresses_plot"] = ml_stresses_plot
-
-    data["rmse_rel_total"] = float(np.sqrt(np.mean((delta_ml_total - delta_ref_total) ** 2)))
-    data["rmse_rel_per_atom"] = float(
-        np.sqrt(np.mean((delta_ml_per_atom - delta_ref_per_atom) ** 2))
-    )
-    data["rmse_forces"] = float(np.sqrt(force_sqerr_sum / force_count))
-    if has_stress:
-        data["rmse_stress"] = float(np.sqrt(stress_sqerr_sum / stress_count))
     return data
-
-
-def global_lims(*arrays):
-    vals = np.concatenate([np.asarray(a).ravel() for a in arrays if len(a) > 0])
-    return [float(np.min(vals)), float(np.max(vals))]
-
-
-def add_top_left_metrics(ax, lines):
-    if not lines:
-        return
-    wrapped_lines = [textwrap.shorten(line, width=110, placeholder="...") for line in lines]
-    ax.text(
-        0.02,
-        0.98,
-        "\n".join(wrapped_lines),
-        transform=ax.transAxes,
-        va="top",
-        ha="left",
-        fontsize=8,
-        bbox=dict(facecolor="white", alpha=0.85, edgecolor="0.5", boxstyle="round,pad=0.3"),
-    )
 
 
 def _load_dataset_wrapper(payload):
@@ -345,6 +444,8 @@ def main():
         print("No valid datasets to plot after loading.")
         sys.exit(1)
 
+    configure_style()
+
     ml_types = sorted({d["ml_label"] for d in datasets})
     has_stress_any = any(d["has_stress"] for d in datasets)
     has_stress_all = all(d["has_stress"] for d in datasets)
@@ -352,63 +453,19 @@ def main():
     if has_stress_any and not has_stress_all:
         print("Note: some datasets have stress, some do not. Plotting stress where available.")
 
-    ncols = 2 if include_stress else 3
-    nrows = 2 if include_stress else 1
+    ncols = 3 if include_stress else 2
+    nrows = 1
     fig, axes = plt.subplots(
-        nrows, ncols, figsize=(6.4 * ncols, 6.2 * nrows), constrained_layout=True
+        nrows,
+        ncols,
+        figsize=(4.7 * ncols, 4.6),
+        constrained_layout=True,
     )
     axes = np.atleast_2d(axes)
     colors = plt.cm.tab20(np.linspace(0, 1, max(2, len(datasets))))
 
-    # Relative Total Energy
-    ax = axes[0, 0]
-    energy_lines = []
-    for i, ds in enumerate(datasets):
-        ax.scatter(
-            ds["delta_ref_total"],
-            ds["delta_ml_total"],
-            alpha=0.45,
-            s=14,
-            color=colors[i],
-        )
-        energy_lines.append(f'{ds["label"]} | RMSE={ds["rmse_rel_total"]:.4f} eV')
-    lims = global_lims(
-        *(ds["delta_ref_total"] for ds in datasets), *(ds["delta_ml_total"] for ds in datasets)
-    )
-    ax.plot(lims, lims, "k--")
-    ax.set_xlabel("ΔE (DFT-calculated) (eV)")
-    ax.set_ylabel("ΔE (ML-predicted) (eV)")
-    ax.set_title("Relative Total Energy Parity")
-    ax.axis("equal")
-    ax.grid(True)
-    add_top_left_metrics(ax, energy_lines)
-
-    # Force
-    ax = axes[0, 1]
-    force_lines = []
-    for i, ds in enumerate(datasets):
-        ax.scatter(
-            ds["ref_forces_plot"],
-            ds["ml_forces_plot"],
-            alpha=0.40,
-            s=10,
-            color=colors[i],
-        )
-        force_lines.append(f'{ds["label"]} | RMSE={ds["rmse_forces"]:.4f} eV/A')
-    lims = global_lims(
-        *(ds["ref_forces_plot"] for ds in datasets), *(ds["ml_forces_plot"] for ds in datasets)
-    )
-    ax.plot(lims, lims, "k--")
-    ax.set_xlabel("DFT-calculated Force (eV/A)")
-    ax.set_ylabel("ML-predicted Force (eV/A)")
-    ax.set_title("Force Parity")
-    ax.axis("equal")
-    ax.grid(True)
-    add_top_left_metrics(ax, force_lines)
-
     # Relative Per-Atom Energy
-    ax = axes[1, 0] if include_stress else axes[0, 2]
-    per_atom_lines = []
+    ax = axes[0, 0]
     for i, ds in enumerate(datasets):
         ax.scatter(
             ds["delta_ref_per_atom"],
@@ -416,68 +473,118 @@ def main():
             alpha=0.45,
             s=14,
             color=colors[i],
+            label=ds["label"],
+            rasterized=True,
         )
-        per_atom_lines.append(f'{ds["label"]} | RMSE={ds["rmse_rel_per_atom"]:.5f} eV/atom')
-    lims = global_lims(
+    lims = padded_limits(
         *(ds["delta_ref_per_atom"] for ds in datasets),
         *(ds["delta_ml_per_atom"] for ds in datasets),
     )
-    ax.plot(lims, lims, "k--")
-    ax.set_xlabel("ΔE per atom (DFT-calculated) (eV)")
-    ax.set_ylabel("ΔE per atom (ML-predicted) (eV)")
-    ax.set_title("Relative Per-Atom Energy Parity")
-    ax.axis("equal")
-    ax.grid(True)
-    add_top_left_metrics(ax, per_atom_lines)
+    ax.plot(lims, lims, color="#222222", linewidth=1.1, linestyle="--", zorder=3)
+    ax.set_xlim(lims)
+    ax.set_ylim(lims)
+    ax.set_xlabel("DFT ΔE/atom (eV/atom)")
+    ax.set_ylabel("ML ΔE/atom (eV/atom)")
+    ax.set_title("Relative Per-Atom Energy Parity", loc="left", fontsize=11, fontweight="semibold", pad=8)
+    finalize_axis(ax)
+    add_stats_box(ax, aggregate_stats(datasets, "per_atom_energy_stats"), "eV/atom")
+
+    # Force
+    ax = axes[0, 1]
+    for i, ds in enumerate(datasets):
+        ax.scatter(
+            ds["ref_forces_plot"],
+            ds["ml_forces_plot"],
+            alpha=0.40,
+            s=10,
+            color=colors[i],
+            label=ds["label"],
+            rasterized=True,
+        )
+    lims = padded_limits(
+        *(ds["ref_forces_plot"] for ds in datasets), *(ds["ml_forces_plot"] for ds in datasets)
+    )
+    ax.plot(lims, lims, color="#222222", linewidth=1.1, linestyle="--", zorder=3)
+    ax.set_xlim(lims)
+    ax.set_ylim(lims)
+    ax.set_xlabel("DFT force component (eV/Å)")
+    ax.set_ylabel("ML force component (eV/Å)")
+    ax.set_title("Force Parity", loc="left", fontsize=11, fontweight="semibold", pad=8)
+    finalize_axis(ax)
+    add_stats_box(ax, aggregate_stats(datasets, "force_stats"), "eV/Å")
+
+    context_text = ", ".join(ds["label"] for ds in datasets)
+    ml_text = "/".join(ml_types)
+    wrapped_context = textwrap.fill(context_text, width=120)
 
     # Stress
     if include_stress:
-        ax = axes[1, 1]
-        stress_lines = []
-        for i, ds in enumerate(datasets):
-            if not ds["has_stress"]:
-                continue
+        ax = axes[0, 2]
+        stressable = [ds for ds in datasets if ds["has_stress"]]
+        for i, ds in enumerate(stressable):
             ax.scatter(
                 ds["ref_stresses_plot"],
                 ds["ml_stresses_plot"],
                 alpha=0.40,
                 s=10,
                 color=colors[i],
+                label=ds["label"],
+                rasterized=True,
             )
-            stress_lines.append(f'{ds["label"]} | RMSE={ds["rmse_stress"]:.5f} eV/A^3')
-        stressable = [ds for ds in datasets if ds["has_stress"]]
-        lims = global_lims(
+        lims = padded_limits(
             *(ds["ref_stresses_plot"] for ds in stressable),
             *(ds["ml_stresses_plot"] for ds in stressable),
         )
-        ax.plot(lims, lims, "k--")
-        ax.set_xlabel("DFT-calculated Stress (eV/A^3)")
-        ax.set_ylabel("ML-predicted Stress (eV/A^3)")
-        ax.set_title("Stress Parity (all components)")
-        ax.axis("equal")
-        ax.grid(True)
-        add_top_left_metrics(ax, stress_lines)
+        ax.plot(lims, lims, color="#222222", linewidth=1.1, linestyle="--", zorder=3)
+        ax.set_xlim(lims)
+        ax.set_ylim(lims)
+        ax.set_xlabel(r"DFT stress component (eV/Å$^3$)")
+        ax.set_ylabel(r"ML stress component (eV/Å$^3$)")
+        ax.set_title("Stress Parity (all components)", loc="left", fontsize=11, fontweight="semibold", pad=8)
+        finalize_axis(ax)
+        add_stats_box(ax, aggregate_stats(stressable, "stress_stats"), "eV/Å$^3$")
 
-    context_text = ", ".join(ds["label"] for ds in datasets)
-    ml_text = "/".join(ml_types)
-    wrapped_context = textwrap.fill(context_text, width=120)
     fig.suptitle(
         f"Parity plots for {len(datasets)} dataset(s) | MLIP: {ml_text}\n{wrapped_context}",
-        fontsize=10,
+        fontsize=12,
+        fontweight="semibold",
     )
+
+    if len(datasets) > 1:
+        handles, labels = axes[0, 0].get_legend_handles_labels()
+        label_map = dict(zip(labels, handles))
+        fig.legend(
+            label_map.values(),
+            label_map.keys(),
+            loc="outside lower center",
+            ncols=min(3, len(label_map)),
+            frameon=False,
+            title="Dataset",
+        )
 
     for ds in datasets:
         print(f"\nDataset: {ds['label']}")
         print(f"  File: {ds['xyz_path']}")
         print(f"  MLIP: {ds['ml_label']}")
         print(f"  Reference frame index: {ds['ref_idx']}")
-        print(f"  RMSE of ΔE (total):  {ds['rmse_rel_total']:.6f} eV")
-        print(f"  RMSE of ΔE/atom:     {ds['rmse_rel_per_atom']:.6f} eV/atom")
-        print(f"  RMSE of forces:      {ds['rmse_forces']:.6f} eV/A")
+        print(
+            f"  ΔE/atom:    RMSE = {ds['per_atom_energy_stats'].rmse:.6f} eV/atom, "
+            f"MAE = {ds['per_atom_energy_stats'].mae:.6f} eV/atom, "
+            f"N = {ds['per_atom_energy_stats'].count:,}"
+        )
+        print(
+            f"  Forces:     RMSE = {ds['force_stats'].rmse:.6f} eV/Å, "
+            f"MAE = {ds['force_stats'].mae:.6f} eV/Å, "
+            f"N = {ds['force_stats'].count:,}"
+        )
         if ds["has_stress"]:
-            print(f"  RMSE of stress:      {ds['rmse_stress']:.6f} eV/A^3")
+            print(
+                f"  Stress:     RMSE = {ds['stress_stats'].rmse:.6f} eV/Å³, "
+                f"MAE = {ds['stress_stats'].mae:.6f} eV/Å³, "
+                f"N = {ds['stress_stats'].count:,}"
+            )
         else:
-            print("  RMSE of stress:      N/A")
+            print("  Stress:     N/A")
 
     plt.show()
 

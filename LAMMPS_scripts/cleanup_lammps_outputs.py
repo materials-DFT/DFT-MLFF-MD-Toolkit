@@ -131,22 +131,21 @@ def confirmed() -> bool:
     return reply in ("y", "yes")
 
 
-def main() -> None:
-    if len(sys.argv) != 2:
-        print(f"Usage: {sys.argv[0]} <directory>", file=sys.stderr)
-        sys.exit(1)
-
-    raw = sys.argv[1].rstrip("/")
-    target = Path(raw).expanduser()
+def resolve_directory_arg(raw: str) -> Path:
+    target = Path(raw.rstrip("/")).expanduser()
     if not target.is_dir():
         print(
             f"Error: '{raw}' is not a directory or does not exist.",
             file=sys.stderr,
         )
         sys.exit(1)
+    return target.resolve()
 
-    target = target.resolve()
 
+def collect_files_for_directory(
+    target: Path,
+) -> tuple[str, list[Path], str, str]:
+    """Return (mode, files, lammps_scope, vasp_scope) for one directory."""
     vasp_scope = ""
     if is_lammps_directory(target):
         mode = "LAMMPS"
@@ -168,26 +167,53 @@ def main() -> None:
     else:
         mode = "LAMMPS"
         files, lammps_scope = collect_lammps_files_to_delete(target)
+    return mode, files, lammps_scope, vasp_scope
 
-    if not files:
-        if mode == "VASP":
-            print(
-                "No files to remove under "
-                f"'{target}' (only kept inputs may be present, or directory is empty)."
-            )
-        else:
-            print(f"No matching files in '{target}' or its subdirectories.")
+
+def main() -> None:
+    if len(sys.argv) < 2:
+        print(f"Usage: {sys.argv[0]} <directory> [<directory> ...]", file=sys.stderr)
+        sys.exit(1)
+
+    targets = [resolve_directory_arg(raw) for raw in sys.argv[1:]]
+
+    plans: list[tuple[Path, str, list[Path], str, str]] = []
+    for target in targets:
+        mode, files, lammps_scope, vasp_scope = collect_files_for_directory(target)
+        plans.append((target, mode, files, lammps_scope, vasp_scope))
+
+    all_files = sorted({p for _, _, files, _, _ in plans for p in files})
+
+    if not all_files:
+        for target, mode, files, _, _ in plans:
+            if files:
+                continue
+            if mode == "VASP":
+                print(
+                    "No files to remove under "
+                    f"'{target}' (only kept inputs may be present, or directory is empty)."
+                )
+            else:
+                print(f"No matching files in '{target}' or its subdirectories.")
         sys.exit(0)
 
-    print(f"Mode: {mode}")
-    print(f"Directory: {target}")
-    if mode == "VASP" and vasp_scope:
-        print(f"Scope: {vasp_scope}")
-    if mode == "LAMMPS":
-        print(f"Scope: {lammps_scope}")
-    print(f"Files to delete ({len(files)}):")
-    for p in files:
-        print(f"  {p}")
+    print(f"Directories: {len(targets)}")
+    for target, mode, files, lammps_scope, vasp_scope in plans:
+        if not files:
+            continue
+        print()
+        print(f"Mode: {mode}")
+        print(f"Directory: {target}")
+        if mode == "VASP" and vasp_scope:
+            print(f"Scope: {vasp_scope}")
+        if mode == "LAMMPS":
+            print(f"Scope: {lammps_scope}")
+        print(f"Files to delete ({len(files)}):")
+        for p in files:
+            print(f"  {p}")
+
+    print()
+    print(f"Total files to delete: {len(all_files)}")
     print()
 
     if not confirmed():
@@ -195,7 +221,7 @@ def main() -> None:
         sys.exit(1)
 
     deleted = 0
-    for p in files:
+    for p in all_files:
         try:
             p.unlink()
             deleted += 1

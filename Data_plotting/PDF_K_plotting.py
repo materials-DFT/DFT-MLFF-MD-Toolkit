@@ -56,8 +56,8 @@ sys.stdout.reconfigure(line_buffering=True)
 #  Constants
 # ---------------------------------------------------------------------------
 
-_SUBFIG_HSPACE_TEMP_BLOCKS = 0.08
-_TIGHT_LAYOUT_RDF_MSD = (0.055, 0.05, 0.985, 0.91)
+_SUBFIG_HSPACE_TEMP_BLOCKS = 0.16
+_TIGHT_LAYOUT_RDF_MSD = (0.055, 0.05, 0.985, 0.88)
 
 ATOMIC_MASS = {
     "H": 1.008, "He": 4.002602, "Li": 6.94, "Be": 9.0121831, "B": 10.81,
@@ -837,7 +837,7 @@ def _plot_k_pair_pdf_figure(
 
     for (group_title, series_pairs), sf in zip(temp_groups, subfigs):
         series_pairs = _sort_series_pairs_for_comparison(list(series_pairs))
-        sf.suptitle(group_title, fontsize=10, weight="bold", y=1.02)
+        sf.suptitle(group_title, fontsize=10, weight="bold", y=0.93)
         grp_results = [R for R, _lab in series_pairs]
         grp_labels = [_lab for _R, _lab in series_pairs]
         multi_dir = len(grp_results) > 1
