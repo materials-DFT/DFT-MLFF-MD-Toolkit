@@ -837,12 +837,37 @@ def _maximize_figure_window(fig):
 def _configure_matplotlib_backend(save=None):
     import matplotlib
     display = os.environ.get("DISPLAY")
-    if save and not display:
+    # File export must be backend-independent; a stale DISPLAY variable is
+    # common on clusters and does not guarantee that Tk is available.
+    if save:
         matplotlib.use("Agg")
     elif display:
         matplotlib.use("TkAgg")
     else:
         matplotlib.use("Agg")
+
+
+def _apply_publication_style(plt):
+    """Apply a compact, consistent style suitable for raster or vector export."""
+    plt.rcParams.update({
+        "font.family": "DejaVu Sans",
+        "font.size": 9,
+        "axes.titlesize": 10,
+        "axes.labelsize": 9,
+        "axes.linewidth": 0.8,
+        "lines.linewidth": 1.5,
+        "xtick.labelsize": 8,
+        "ytick.labelsize": 8,
+        "xtick.direction": "in",
+        "ytick.direction": "in",
+        "xtick.top": True,
+        "ytick.right": True,
+        "legend.fontsize": 7.5,
+        "legend.framealpha": 0.95,
+        "savefig.dpi": 300,
+        "savefig.bbox": "tight",
+        "axes.axisbelow": True,
+    })
 
 
 def infer_temperature_from_path(sim_dir):
@@ -1072,14 +1097,14 @@ def _finalize_psd_only_window(fig, save, maximize_window):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         for sf in fig.subfigs:
-            sf.subplots_adjust(hspace=0.55, left=0.10, right=0.98, top=0.88, bottom=0.15)
+            sf.subplots_adjust(hspace=0.10, left=0.12, right=0.98, top=0.92, bottom=0.10)
     _apply_vps_psd_layout(fig)
     display = os.environ.get("DISPLAY")
     if save:
         out_path = Path(save)
-        fig.savefig(out_path, dpi=200, bbox_inches="tight", pad_inches=0.18)
+        fig.savefig(out_path, dpi=300, bbox_inches="tight", pad_inches=0.18)
         print(f"Saved figure → {out_path.resolve()}")
-    if not save or display:
+    if not save:
         if maximize_window and display:
             fig.canvas.draw()
             _maximize_figure_window(fig)
@@ -1093,13 +1118,17 @@ def _finalize_md_figure(fig, save, maximize_window, tight_layout_rect=None):
     import matplotlib.pyplot as plt
 
     rect = tight_layout_rect if tight_layout_rect is not None else _TIGHT_LAYOUT_DEFAULT
-    fig.tight_layout(rect=rect)
+    get_layout_engine = getattr(fig, "get_layout_engine", None)
+    layout_engine = get_layout_engine() if get_layout_engine is not None else None
+    has_subfigures = bool(getattr(fig, "subfigs", []))
+    if layout_engine is None and not has_subfigures:
+        fig.tight_layout(rect=rect)
     display = os.environ.get("DISPLAY")
     if save:
         out_path = Path(save)
-        fig.savefig(out_path, dpi=200, bbox_inches="tight", pad_inches=0.15)
+        fig.savefig(out_path, dpi=300, bbox_inches="tight", pad_inches=0.15)
         print(f"Saved figure → {out_path.resolve()}")
-    if not save or display:
+    if not save:
         if maximize_window and display:
             fig.canvas.draw()
             _maximize_figure_window(fig)
@@ -1146,15 +1175,15 @@ def _draw_psd_temperature_subfig(
             f"Velocity spectra — {group_title}",
             fontsize=10,
             weight="bold",
-            y=1.01,
+            y=0.91,
         )
     gs = sf.add_gridspec(
         nsp, 2,
         width_ratios=[1.0, 1.0],
-        wspace=0.35,
-        hspace=0.55,
-        top=0.85,
-        bottom=0.18,
+        wspace=0.14,
+        hspace=0.16,
+        top=0.88,
+        bottom=0.12,
     )
     axes_psd = []
     for row in range(nsp):
@@ -1233,7 +1262,7 @@ def _draw_psd_temperature_subfig(
             ax_psd.legend(
                 fontsize=7,
                 loc="upper right",
-                framealpha=0.92,
+                framealpha=0.95,
                 fancybox=False,
             )
 
@@ -1246,9 +1275,9 @@ def _draw_psd_temperature_subfig(
             r"[(m/s)$^2$/(cm$^{-1}$)]",
             xy=(0, 0.5),
             xycoords='axes fraction',
-            xytext=(-45, 0),
+            xytext=(-52, 0),
             textcoords='offset points',
-            fontsize=8,
+        fontsize=7.5,
             ha='center',
             va='center',
             rotation=90,
@@ -1323,12 +1352,14 @@ def _draw_psd_temperature_subfig(
     )
     if T_nom is not None:
         ax_cum.text(
-            0.02, 0.98,
+            0.02, 0.88,
             f"grey dash: nominal T = {T_nom:g} K",
             transform=ax_cum.transAxes,
-            fontsize=6,
+            fontsize=7,
             color="0.35",
             va="top",
+            bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.8,
+                  "pad": 1.5},
         )
 
 
@@ -1423,6 +1454,7 @@ def make_psd_figure(
     """One window: velocity PSD and cumulative ∫S (or T) only, grouped by temperature."""
     _configure_matplotlib_backend(save=save)
     import matplotlib.pyplot as plt
+    _apply_publication_style(plt)
 
     temp_groups = group_results_by_temperature(sim_dirs, results_list, labels)
     colors = plt.cm.tab10.colors
@@ -1437,11 +1469,11 @@ def make_psd_figure(
         heights.append(max(3.0, 2.6 * nsp))
 
     n_blocks = len(temp_groups)
-    fig_h = max(7.5, 0.42 * sum(heights) + 1.5)
+    fig_h = max(5.6, 0.29 * sum(heights) + 0.55)
     fig = plt.figure(figsize=(14.0, fig_h))
-    fig.subplots_adjust(top=0.92, bottom=0.08)
+    fig.subplots_adjust(top=0.95, bottom=0.04, left=0.06, right=0.98)
     subfigs = fig.subfigures(
-        n_blocks, 1, height_ratios=heights, hspace=_SUBFIG_HSPACE_TEMP_BLOCKS + 0.04
+        n_blocks, 1, height_ratios=heights, hspace=0.045
     )
     subfigs = np.atleast_1d(subfigs).ravel()
 
@@ -1480,6 +1512,7 @@ def make_rdf_msd_figure(
     """One window: RDF and MSD only (stacked by temperature when available)."""
     _configure_matplotlib_backend(save=save)
     import matplotlib.pyplot as plt
+    _apply_publication_style(plt)
 
     colors = plt.cm.tab10.colors
     ls_cycle = ["-", "--", "-.", ":"]
@@ -1490,15 +1523,17 @@ def make_rdf_msd_figure(
     temp_groups = group_results_by_temperature(sim_dirs, results_list, labels)
     n_blocks = max(len(temp_groups), 1)
     fig_h = max(5.8, 2.8 * n_blocks + 0.8)
-    fig = plt.figure(figsize=(13.5, fig_h))
+    fig = plt.figure(figsize=(13.5, fig_h), layout="constrained")
     fig.suptitle("Structure & diffusion — MD comparison", fontsize=13, weight="bold", y=0.995)
 
     subfigs = fig.subfigures(n_blocks, 1, hspace=_SUBFIG_HSPACE_TEMP_BLOCKS)
     subfigs = np.atleast_1d(subfigs).ravel()
 
     for (group_title, series_pairs), sf in zip(temp_groups, subfigs):
-        sf.suptitle(group_title, fontsize=10, weight="bold", y=1.01)
-        ax_rdf, ax_msd = sf.subplots(1, 2)
+        sf.suptitle(group_title, fontsize=10, weight="bold", y=0.985)
+        ax_rdf, ax_msd = sf.subplots(
+            1, 2, gridspec_kw={"wspace": 0.14, "top": 0.79, "bottom": 0.19}
+        )
         grp_results = [R for R, _lab in series_pairs]
         grp_labels = [_lab for _R, _lab in series_pairs]
         _plot_rdf_msd_axes(
@@ -1535,6 +1570,7 @@ def make_combined_figure(
     """
     _configure_matplotlib_backend(save=save)
     import matplotlib.pyplot as plt
+    _apply_publication_style(plt)
 
     temp_groups = group_results_by_temperature(sim_dirs, results_list, labels)
     colors = plt.cm.tab10.colors
@@ -1552,7 +1588,9 @@ def make_combined_figure(
     n_blocks = len(temp_groups) + 1
     fig_h = max(7.0, 0.36 * sum(heights) + 1.0)
     fig = plt.figure(figsize=(13.5, fig_h))
-    fig.suptitle("MD simulation comparison", fontsize=13, weight="bold", y=0.992)
+    fig.subplots_adjust(top=0.93, bottom=0.04, left=0.06, right=0.98)
+    # The per-block titles below identify each temperature; omitting a second
+    # global title keeps the first block title clear of the figure boundary.
     subfigs = fig.subfigures(
         n_blocks, 1, height_ratios=heights, hspace=_SUBFIG_HSPACE_TEMP_BLOCKS
     )
@@ -1573,8 +1611,10 @@ def make_combined_figure(
         )
 
     sf_last = subfigs[-1]
-    sf_last.suptitle("Structure & diffusion", fontsize=10, weight="bold", y=1.01)
-    ax_rdf, ax_msd = sf_last.subplots(1, 2)
+    sf_last.suptitle("Structure & diffusion", fontsize=10, weight="bold", y=0.985)
+    ax_rdf, ax_msd = sf_last.subplots(
+        1, 2, gridspec_kw={"wspace": 0.14, "top": 0.79, "bottom": 0.19}
+    )
     _plot_rdf_msd_axes(
         ax_rdf,
         ax_msd,

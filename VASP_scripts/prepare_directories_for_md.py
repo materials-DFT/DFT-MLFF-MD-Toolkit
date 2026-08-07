@@ -1220,19 +1220,25 @@ run ${{target}} upto
                         except Exception as e:
                             self.log(f"Couldn't copy CONTCAR->POSCAR: {e}", "WARNING")
                 else:
-                    # LAMMPS - find and overwrite existing input file
-                    existing_input = None
-                    for f in os.listdir(temp_dir):
-                        if f.startswith("in.") and ("allegro" in f or f.endswith(".in")):
-                            existing_input = f
-                            break
-                    
-                    if existing_input:
-                        input_path = os.path.join(temp_dir, existing_input)
-                        self.write_lammps_input(input_path, species_list, md_params, temp)
-                        self.log(f"Overwrote {existing_input}")
+                    # LAMMPS: overwrite every existing input, or create the standard one.
+                    existing_inputs = sorted(
+                        f for f in os.listdir(temp_dir)
+                        if f.startswith("in.") or f.endswith(".in") or f.endswith(".txt")
+                    )
+                    if existing_inputs:
+                        for existing_input in existing_inputs:
+                            input_path = os.path.join(temp_dir, existing_input)
+                            self.write_lammps_input(input_path, species_list, md_params, temp)
+                            self.log(f"Overwrote {existing_input}")
                     else:
-                        self.log(f"No existing LAMMPS input file found in {temp_dir}, skipping", "WARNING")
+                        input_name = (
+                            "in.npt_md_allegro"
+                            if md_params.ensemble == "npt"
+                            else "in.nvt_allegro"
+                        )
+                        input_path = os.path.join(temp_dir, input_name)
+                        self.write_lammps_input(input_path, species_list, md_params, temp)
+                        self.log(f"Created {input_name}")
                 
                 # Clean up unwanted files
                 for unwanted in files_to_delete:

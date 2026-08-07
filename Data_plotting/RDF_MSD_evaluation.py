@@ -786,12 +786,37 @@ def compute_msd_from_cartesian(
 def _configure_matplotlib_backend(save=None):
     import matplotlib
     display = os.environ.get("DISPLAY")
-    if save and not display:
+    # File export must be backend-independent; a stale DISPLAY variable is
+    # common on clusters and does not guarantee that Tk is available.
+    if save:
         matplotlib.use("Agg")
     elif display:
         matplotlib.use("TkAgg")
     else:
         matplotlib.use("Agg")
+
+
+def _apply_publication_style(plt):
+    """Apply a compact, consistent style suitable for raster or vector export."""
+    plt.rcParams.update({
+        "font.family": "DejaVu Sans",
+        "font.size": 9,
+        "axes.titlesize": 10,
+        "axes.labelsize": 9,
+        "axes.linewidth": 0.8,
+        "lines.linewidth": 1.5,
+        "xtick.labelsize": 8,
+        "ytick.labelsize": 8,
+        "xtick.direction": "in",
+        "ytick.direction": "in",
+        "xtick.top": True,
+        "ytick.right": True,
+        "legend.fontsize": 7.5,
+        "legend.framealpha": 0.95,
+        "savefig.dpi": 300,
+        "savefig.bbox": "tight",
+        "axes.axisbelow": True,
+    })
 
 
 def infer_temperature_from_path(sim_dir):
@@ -881,7 +906,8 @@ def _maximize_figure_window(fig):
         pass
 
 
-_SUBFIG_HSPACE_TEMP_BLOCKS = 0.12
+# Compact vertical separation between stacked RDF/MSD blocks.
+_SUBFIG_HSPACE_TEMP_BLOCKS = 0.001
 _TIGHT_LAYOUT_RDF_MSD = (0.04, 0.06, 0.98, 0.92)
 
 
@@ -911,7 +937,7 @@ def _finalize_md_figure(fig, save, maximize_window, tight_layout_rect=None, skip
         out_path = Path(save)
         fig.savefig(out_path, dpi=200, bbox_inches="tight", pad_inches=0.15)
         print(f"Saved figure -> {out_path.resolve()}")
-    if not save or display:
+    if not save:
         if maximize_window and display:
             fig.canvas.draw()
             _maximize_figure_window(fig)
@@ -944,13 +970,13 @@ def _plot_rdf_msd_axes(
             lbl = f"{lab} ({pk})" if len(pairs_to_plot) > 1 else lab
             ax_rdf.plot(r, g, color=colors[i % 10], ls=ls, label=lbl, lw=1.3)
     ax_rdf.axhline(1, c="grey", lw=0.4, ls="--")
-    ax_rdf.set_xlabel("r (A)")
+    ax_rdf.set_xlabel(r"$r$ (Å)")
     ax_rdf.set_ylabel("g(r)")
     ax_rdf.set_title("Radial distribution function")
     ax_rdf.legend(
-        fontsize=6.5,
+        fontsize=7,
         ncol=2 if len(results_list) > 2 else 1,
-        framealpha=0.92,
+        framealpha=0.95,
         loc="upper right",
         fancybox=False,
     )
@@ -970,8 +996,8 @@ def _plot_rdf_msd_axes(
                 color=colors[i % 10], ls=ls_cycle[ispec % len(ls_cycle)],
                 label=lbl, lw=1.3,
             )
-    ax_msd.set_xlabel("t (ps)")
-    ax_msd.set_ylabel("MSD (A^2)")
+    ax_msd.set_xlabel(r"$τ$ (ps)")
+    ax_msd.set_ylabel(r"MSD (Å$^2$)")
     ax_msd.set_title("Mean square displacement")
     handles, leg_labs = ax_msd.get_legend_handles_labels()
     n_leg = len(handles)
@@ -984,7 +1010,7 @@ def _plot_rdf_msd_axes(
     ax_msd.legend(
         handles,
         leg_labs,
-        fontsize=6.5,
+        fontsize=7,
         ncol=ncol,
         framealpha=0.92,
         loc="upper left",
@@ -1004,10 +1030,12 @@ def make_rdf_msd_figure(
     msd_tmax=None,
     save=None,
     maximize_window=True,
+    show_dirs=False,
 ):
-    """One window: RDF and MSD only (stacked by temperature when available)."""
+    """One window: RDF and MSD, optionally labeled with source directories."""
     _configure_matplotlib_backend(save=save)
     import matplotlib.pyplot as plt
+    _apply_publication_style(plt)
 
     colors = plt.cm.tab10.colors
     ls_cycle = ["-", "--", "-.", ":"]
@@ -1017,9 +1045,11 @@ def make_rdf_msd_figure(
 
     temp_groups = group_indices_by_temperature(sim_dirs)
     n_blocks = max(len(temp_groups), 1)
-    fig_h = max(6.0, 3.2 * n_blocks + 1.2)
+    # Keep each block compact while reserving a small, explicit header band
+    # for the directory label above the axes.
+    fig_h = max(4.8, 2.45 * n_blocks + 0.45)
     fig = plt.figure(figsize=(13.5, fig_h))
-    fig.subplots_adjust(top=0.92, bottom=0.08, left=0.06, right=0.98)
+    fig.subplots_adjust(top=0.985, bottom=0.055, left=0.055, right=0.985)
 
     subfigs = fig.subfigures(n_blocks, 1, hspace=_SUBFIG_HSPACE_TEMP_BLOCKS)
     subfigs = np.atleast_1d(subfigs).ravel()
@@ -1030,8 +1060,18 @@ def make_rdf_msd_figure(
             header_text = header_dirs[0]
         else:
             header_text = "\n".join(header_dirs)
-        sf.suptitle(header_text, fontsize=9, weight="bold", y=0.95)
-        ax_rdf, ax_msd = sf.subplots(1, 2, gridspec_kw={"wspace": 0.28, "top": 0.85, "bottom": 0.15})
+        if show_dirs:
+            sf.suptitle(header_text, fontsize=8.5, weight="bold", y=0.985,
+                        ha="center", wrap=True)
+        ax_rdf, ax_msd = sf.subplots(
+            1, 2,
+            gridspec_kw={
+                "wspace": 0.14,
+                # Leave room for axes titles when no directory header is drawn.
+                "top": 0.82 if show_dirs else 0.87,
+                "bottom": 0.17,
+            },
+        )
         grp_results = [results_list[i] for i in idxs]
         grp_labels = [labels[i] for i in idxs]
         _plot_rdf_msd_axes(
@@ -1411,6 +1451,11 @@ Examples:
         help="do not maximize the plot window to the screen",
     )
     ap.add_argument(
+        "--show_dirs",
+        action="store_true",
+        help="show source directory labels above each RDF/MSD subplot row",
+    )
+    ap.add_argument(
         "--save",
         type=str,
         default=None,
@@ -1478,6 +1523,7 @@ Examples:
             msd_tmax=args.msd_tmax,
             save=args.save,
             maximize_window=not args.no_maximize,
+            show_dirs=args.show_dirs,
         )
 
 

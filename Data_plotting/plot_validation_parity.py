@@ -603,8 +603,8 @@ def plot_parity(
             "delta_pred_per_atom",
             "per_atom_energy_stats",
             "Relative Energy per Atom",
-            "DFT delta E/atom (eV/atom)",
-            "ML delta E/atom (eV/atom)",
+            "DFT ΔE/atom (eV/atom)",
+            "ML ΔE/atom (eV/atom)",
             "eV/atom",
         ),
         (
@@ -612,9 +612,9 @@ def plot_parity(
             "pred_forces",
             "force_stats",
             "Forces",
-            "DFT force component (eV/A)",
-            "ML force component (eV/A)",
-            "eV/A",
+            "DFT force component (eV/Å)",
+            "ML force component (eV/Å)",
+            "eV/Å",
         ),
     ]
     if include_total_energy:
@@ -637,9 +637,9 @@ def plot_parity(
                 "pred_stress",
                 "stress_stats",
                 "Stress",
-                "DFT stress component (eV/A^3)",
-                "ML stress component (eV/A^3)",
-                "eV/A^3",
+                r"DFT stress component (eV/Å$^3$)",
+                r"ML stress component (eV/Å$^3$)",
+                r"eV/Å$^3$",
             )
         )
 
@@ -692,10 +692,10 @@ def print_summary(datasets: list[dict]) -> None:
         else:
             print(f"  Frames: {dataset['n_frames']:,}")
         print(f"  Energy reference frame: {dataset['ref_index']}")
-        print(f"  RMSE delta E/atom: {dataset['per_atom_energy_stats'].rmse:.6f} eV/atom")
-        print(f"  RMSE forces:       {dataset['force_stats'].rmse:.6f} eV/A")
+        print(f"  RMSE ΔE/atom: {dataset['per_atom_energy_stats'].rmse:.6f} eV/atom")
+        print(f"  RMSE forces:       {dataset['force_stats'].rmse:.6f} eV/Å")
         if dataset["has_stress"]:
-            print(f"  RMSE stress:       {dataset['stress_stats'].rmse:.6f} eV/A^3")
+            print(f"  RMSE stress:       {dataset['stress_stats'].rmse:.6f} eV/Å³")
         else:
             print("  RMSE stress:       N/A")
 
