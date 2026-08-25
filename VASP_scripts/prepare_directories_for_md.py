@@ -30,8 +30,9 @@ VASP and LAMMPS codes, supporting NPT and NVT ensembles.
    - Stable workflow: CG minimize, T ramp (Tinit=Tmd/6), fixed-cell burn-in,
      then production NPT/NVT with small timestep (0.00010 ps)
    - Translates VASP Langevin parameters to LAMMPS fix langevin scale factors
-   - NPT barostat values remain VASP-derived (pmass, gamma_L); geometry uses
-     aniso flip no; restart-aware dump (burn-in frames + production append)
+   - NPT barostat Pdamp/friction both derived from VASP LANGEVIN_GAMMA_L (PMASS has
+     no LAMMPS press/langevin equivalent); geometry uses aniso flip no; restart-aware
+     dump (burn-in frames + production append)
    - Supports Allegro/NequIP pair styles with Kokkos
 
 Usage:
@@ -1042,14 +1043,15 @@ fix lang all langevin ${{Tmd}} ${{Tmd}} ${{lang_damp}} 48279 &
 """
 
         if md_params.ensemble == "npt":
-            content += f"""# Barostat: VASP LANGEVIN_GAMMA_L = {md_params.langevin_gamma_l:.3f} ps^-1, PMASS = {md_params.pmass:.0f}
-variable      pmass equal {md_params.pmass:.1f}
-variable      pmass0 equal {md_params.pmass / 2:.1f}
-variable      T0 equal {temperature:.1f}
-variable      baro_pd_base equal 50.0
-variable      baro_pd equal v_baro_pd_base*sqrt(v_pmass/v_pmass0)*sqrt(v_T0/v_Tmd)
+            content += f"""# Barostat: VASP LANGEVIN_GAMMA_L = {md_params.langevin_gamma_l:.3f} ps^-1 (PMASS = {md_params.pmass:.0f} has no
+# direct LAMMPS press/langevin equivalent: that fix takes a damping *time* (Pdamp), not a mass,
+# and derives its own fictitious barostat mass internally). VASP's Langevin barostat only exposes
+# one damping timescale (1/LANGEVIN_GAMMA_L), so we reuse it for both LAMMPS keywords.
+# LAMMPS docs (fix press/langevin) recommend friction ~= Pdamp for well-behaved dynamics, and
+# warn that Pdamp much larger than that makes the box take a very long time to equilibrate.
 variable      gamma_L equal {md_params.langevin_gamma_l:.3f}
 variable      friction_L equal 1.0/v_gamma_L
+variable      baro_pd equal v_friction_L
 fix baro all press/langevin aniso ${{Ptarget}} ${{Ptarget}} ${{baro_pd}} temp ${{Tmd}} ${{Tmd}} 48280 flip no friction ${{friction_L}}
 """
 

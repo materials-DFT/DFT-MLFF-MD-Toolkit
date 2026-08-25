@@ -18,15 +18,129 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 try:
     from ase.io import read, write
+    import ase.io.vasp_parsers.vasp_outcar_parsers as _vasp_outcar_parsers
 except ImportError:
     print("Error: ASE is required. Install with: pip install ase", file=sys.stderr)
     sys.exit(1)
 
 from vasp_step_convergence import filter_images_converged_only
+
+
+# ============================================================================
+# Work around an ASE limitation reading CONTCAR/POSCAR from interface
+# structures built by concatenating multiple slabs without merging repeated
+# species into contiguous blocks (e.g. "K Mn O K Mn O ..." instead of
+# "K Mn O"). VASP wraps the atom-symbols/atom-counts header lines onto
+# additional physical lines once there are too many atom-type groups, but
+# ASE's POSCAR reader only consumes one physical line per header field, so
+# it misparses the wrapped continuation as the next field (e.g. `int('O')`).
+#
+# When reading an OUTCAR, ASE separately peeks at CONTCAR/POSCAR in the same
+# directory purely to recover selective-dynamics constraints
+# (read_constraints_from_file); atom order/species for the actual frame
+# always come from OUTCAR itself, never from this side file. So the fix
+# below only needs to re-join wrapped header lines back into single logical
+# lines -- it must NOT reorder atoms, since constraint indices are
+# positional and must still line up with OUTCAR's atom order.
+# ============================================================================
+
+_orig_read_constraints_from_file = _vasp_outcar_parsers.read_constraints_from_file
+_dewrap_rescue_count = 0
+
+
+def _is_all_int(tokens: list[str]) -> bool:
+    if not tokens:
+        return False
+    try:
+        for t in tokens:
+            int(t)
+        return True
+    except ValueError:
+        return False
+
+
+def _dewrap_poscar_lines(lines: list[str]) -> list[str] | None:
+    """Re-join wrapped atom-symbols/atom-counts header lines in a
+    POSCAR/CONTCAR into single logical lines, without reordering or
+    deduplicating anything. Returns None if there's nothing to merge
+    (file too short, or no wrapping detected)."""
+    if len(lines) < 8:
+        return None
+
+    idx = 5  # 0=comment, 1=scale factor, 2-4=lattice vectors
+    symbols_start = idx
+    while idx < len(lines) and lines[idx].split() and not _is_all_int(lines[idx].split()):
+        idx += 1
+    symbols_end = idx
+
+    counts_start = idx
+    while idx < len(lines) and _is_all_int(lines[idx].split()):
+        idx += 1
+    counts_end = idx
+
+    n_symbol_lines = symbols_end - symbols_start
+    n_count_lines = counts_end - counts_start
+    if n_count_lines == 0 or (n_symbol_lines <= 1 and n_count_lines <= 1):
+        return None  # nothing wrapped (or not a shape we recognize)
+
+    def _merge(block: list[str]) -> str:
+        return " ".join(" ".join(l.split()) for l in block) + "\n"
+
+    new_lines = list(lines[:symbols_start])
+    if n_symbol_lines:
+        new_lines.append(_merge(lines[symbols_start:symbols_end]))
+    new_lines.append(_merge(lines[counts_start:counts_end]))
+    new_lines.extend(lines[counts_end:])
+    return new_lines
+
+
+def _read_constraints_with_dewrap(directory):
+    """Drop-in replacement for ASE's read_constraints_from_file that falls
+    back to a de-wrapped CONTCAR/POSCAR copy when the original raises
+    (interleaved-species header wrap). Preserves original behavior
+    (including re-raising) for files the de-wrap can't fix, e.g. genuinely
+    empty/truncated CONTCARs from crashed jobs."""
+    global _dewrap_rescue_count
+    try:
+        return _orig_read_constraints_from_file(directory)
+    except Exception as orig_exc:
+        directory = Path(directory)
+        for filename in ("CONTCAR", "POSCAR"):
+            fpath = directory / filename
+            if not fpath.is_file():
+                continue
+            try:
+                with fpath.open("r") as f:
+                    lines = f.readlines()
+            except OSError:
+                continue
+            fixed = _dewrap_poscar_lines(lines)
+            if fixed is None:
+                continue
+            tmp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w", suffix=".vasp", delete=False
+                ) as tmp:
+                    tmp.writelines(fixed)
+                    tmp_path = tmp.name
+                constraint = read(tmp_path, format="vasp").constraints
+            except Exception:
+                continue
+            finally:
+                if tmp_path is not None:
+                    os.unlink(tmp_path)
+            _dewrap_rescue_count += 1
+            return constraint
+        raise orig_exc
+
+
+_vasp_outcar_parsers.read_constraints_from_file = _read_constraints_with_dewrap
 
 
 # ============================================================================
@@ -155,6 +269,12 @@ def main() -> None:
         if not args.quiet and skipped:
             print(
                 f"  Skipped {skipped} OUTCAR(s) (convergence check failed or no data).",
+                file=sys.stderr,
+            )
+        if not args.quiet and _dewrap_rescue_count:
+            print(
+                f"  Recovered {_dewrap_rescue_count} OUTCAR(s) with wrapped/interleaved "
+                f"CONTCAR or POSCAR headers.",
                 file=sys.stderr,
             )
 
