@@ -48,6 +48,7 @@ python Data_plotting/parity_plot_per_atom.py output.xyz
   - `extract_all_frames.py`: all OUTCAR frames -> one extxyz.
   - `extract_optimized_frames.py`: lowest-energy frame per OUTCAR.
   - `extract_frames_from_md.py`: midpoint frame extraction for MD runs.
+  - `extract_diverse_frames_soap.py`: SOAP descriptor + global farthest-point sampling to pick maximally diverse frames across one or more directories of MD OUTCARs.
   - `extract_bulk_modulus_lowest_10_frames.py`: lowest-energy subset from EOS directories.
 - Conversion/prep:
   - `convert_trajectory_to_extxyz.py`, `poscar_to_lammps.py`, `gaussian_to_poscar.py`, `unwrap_xdatcar.py`.
@@ -117,6 +118,7 @@ Optional or script-specific packages:
 - `pymatgen` (some POSCAR/composition tasks)
 - `torch`, `mace-torch`, `nequip`, `nequip-allegro`, `fairchem-core` (MLFF workflows)
 - `quests` (dataset compression scripts)
+- `dscribe` (SOAP descriptors for `extract_diverse_frames_soap.py`)
 
 External tooling:
 

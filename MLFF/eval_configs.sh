@@ -30,7 +30,7 @@ Usage:
 
 WORK_DIR defaults to the directory where you run sbatch (SLURM_SUBMIT_DIR).
   - Put exactly one .xyz file (structures to evaluate) in WORK_DIR.
-  - Put one model file in WORK_DIR, or Allegro best.ckpt/last.ckpt in a parent models/ dir.
+  - Put one model file in WORK_DIR, or Allegro last.ckpt/last.ckpt in a parent models/ dir.
   - Backend is auto-detected from the model extension (.model → MACE, .ckpt → Allegro).
   - Optional: -m/--model FILE, -c/--configs FILE, -h/--help.
 USAGE
@@ -76,8 +76,8 @@ find_allegro_model_in_parents() {
   local dir="$1"
   local depth=0
   while [[ $depth -lt 12 && "$dir" != "/" ]]; do
-    if [[ -f "$dir/models/best.ckpt" ]]; then
-      echo "$dir/models/best.ckpt"
+    if [[ -f "$dir/models/last.ckpt" ]]; then
+      echo "$dir/models/last.ckpt"
       return 0
     fi
     dir="$(dirname "$dir")"
@@ -121,7 +121,7 @@ if [[ -z "${CONFIGS_FILE}" ]]; then
 fi
 
 # ===== Autodetect MODEL_FILE and BACKEND from submit directory =====
-# Rule: .model → MACE, .ckpt → Allegro. One model file in cwd; if none, Allegro can use ../models/best.ckpt or last.ckpt.
+# Rule: .model → MACE, .ckpt → Allegro. One model file in cwd; if none, Allegro can use ../models/last.ckpt or last.ckpt.
 if [[ -z "${MODEL_FILE}" ]]; then
   shopt -s nullglob
   MODEL_FILES=( ./*.model )
@@ -148,11 +148,11 @@ if [[ -z "${MODEL_FILE}" ]]; then
     printf '  %s\n' "${CKPT_FILES[@]}"
     exit 1
   else
-    # No model in cwd: walk up to find Allegro-style models/best.ckpt or models/last.ckpt
+    # No model in cwd: walk up to find Allegro-style models/last.ckpt or models/last.ckpt
     if MODEL_FILE="$(find_allegro_model_in_parents "$(pwd)")"; then
       BACKEND="allegro"
     else
-      echo "❌ Error: No model in current directory. Put one .model (MACE) or one .ckpt (Allegro) here, or put best.ckpt/last.ckpt in a parent models/ directory for Allegro."
+      echo "❌ Error: No model in current directory. Put one .model (MACE) or one .ckpt (Allegro) here, or put last.ckpt/last.ckpt in a parent models/ directory for Allegro."
       exit 1
     fi
   fi
