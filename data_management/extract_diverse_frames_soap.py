@@ -4,12 +4,14 @@
 # /dev/null so only the internal log (e.g. md_frames_soap.log) and xyz file
 # are written in the working directory.
 #
-# If using -j/--n-jobs > 1, set --cpus-per-task to match.
+# cpus-per-task is set to 16 to match -j/--n-jobs 16 below; if you pass a
+# different -j on the sbatch command line, update --cpus-per-task to match.
 #SBATCH --job-name=extract_soap
+#SBATCH --partition=cpucluster
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=1
-#SBATCH --mem=8G
-#SBATCH --time=04:00:00
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=32G
+#SBATCH --time=18:00:00
 #SBATCH --output=/dev/null
 #SBATCH --error=/dev/null
 """
@@ -46,15 +48,18 @@ independent. Candidates are sorted into a canonical order before farthest-
 point sampling, so output is identical regardless of --n-jobs.
 
 Requires: ase, dscribe, numpy
-Run interactively:  python extract_diverse_frames_soap.py . -n 200
-Run on cluster:     sbatch extract_diverse_frames_soap.py . -n 200
-(For sbatch, make script executable: chmod +x extract_diverse_frames_soap.py)
+Run interactively:  python extract_diverse_frames_soap.py .
+Run on cluster:     sbatch extract_diverse_frames_soap.py . -j 16
+(Script is already executable; the #SBATCH header above requests the
+cpucluster partition, 16 cores, 32G, and an 18-hour walltime. Pass a
+different -j on the command line only if you also change --cpus-per-task.)
 
 Usage:
-  python extract_diverse_frames_soap.py [paths ...] -n N_FRAMES
+  python extract_diverse_frames_soap.py [paths ...] [-n N_FRAMES]
       [--out frames.xyz] [--log ...] [--no-convergence-check]
       [--stride 1] [--r-cut 5.0] [--n-max 8] [--l-max 6] [--sigma 0.5]
       [-j N_JOBS]
+  (-n/--n-frames defaults to 600 if omitted)
   (paths defaults to . if omitted; multiple directories are pooled together)
 """
 
@@ -557,8 +562,8 @@ def main():
     p.add_argument(
         "-n", "--n-frames",
         type=int,
-        required=True,
-        help="Total number of frames to select across all trajectories",
+        default=600,
+        help="Total number of frames to select across all trajectories (default: 600)",
     )
     p.add_argument(
         "--out",
