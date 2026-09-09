@@ -88,6 +88,116 @@ def write_kpoints(path):
     )
 
 
+def read_poscar_species(poscar_path: Path):
+    """Read element symbols and counts straight from a VASP5 POSCAR's species lines.
+
+    Read from the file directly (not via ASE) so the order always matches
+    whatever is actually on disk, which is what MAGMOM order must follow.
+    """
+    lines = poscar_path.read_text().splitlines()
+    if len(lines) < 7:
+        raise SystemExit(f"Error: {poscar_path} is too short to be a VASP5 POSCAR")
+    symbols = lines[5].split()
+    counts_line = lines[6].split()
+    if not symbols or not all(s.isalpha() for s in symbols):
+        raise SystemExit(
+            f"Error: {poscar_path} line 6 doesn't look like an element symbols line "
+            "(expected VASP5 format with a species line before the counts line)"
+        )
+    try:
+        counts = [int(c) for c in counts_line]
+    except ValueError:
+        raise SystemExit(f"Error: {poscar_path} line 7 doesn't look like a counts line")
+    if len(symbols) != len(counts):
+        raise SystemExit(f"Error: {poscar_path} species/count line length mismatch")
+    return symbols, counts
+
+
+def update_incar_for_dir(dest: Path, dry_run: bool = False) -> bool:
+    """Rewrite System/MAGMOM (from POSCAR) and force ISTART=0/ICHARG=2 in dest/INCAR.
+
+    Single-point jobs should not start from a WAVECAR/CHGCAR, so ISTART and
+    ICHARG are always pinned regardless of their current value. Every other
+    line in the INCAR is left untouched. Returns True if the file changed
+    (or would change, under --dry-run).
+    """
+    symbols, counts = read_poscar_species(dest / "POSCAR")
+    system_name = "".join(f"{sym}{count}" for sym, count in zip(symbols, counts))
+    magmom = generate_magmom(symbols, counts)
+
+    incar_path = dest / "INCAR"
+    if not incar_path.is_file():
+        if not dry_run:
+            write_incar(incar_path, system_name, magmom)
+        return True
+
+    lines = incar_path.read_text().splitlines(keepends=True)
+
+    saw_system = False
+    saw_magmom = False
+    saw_istart = False
+    saw_icharg = False
+    new_lines = []
+    for line in lines:
+        stripped = line.lstrip()
+        if stripped.startswith("System") and "=" in stripped:
+            new_lines.append(f"System = {system_name} single-point\n")
+            saw_system = True
+        elif stripped.startswith("MAGMOM") and "=" in stripped:
+            new_lines.append(f"MAGMOM = {magmom}\n")
+            saw_magmom = True
+        elif stripped.startswith("ISTART") and "=" in stripped:
+            new_lines.append("ISTART = 0\n")
+            saw_istart = True
+        elif stripped.startswith("ICHARG") and "=" in stripped:
+            new_lines.append("ICHARG = 2\n")
+            saw_icharg = True
+        else:
+            new_lines.append(line)
+
+    if not saw_system or not saw_magmom or not saw_istart or not saw_icharg:
+        missing = [
+            name for name, seen in (
+                ("System", saw_system), ("MAGMOM", saw_magmom),
+                ("ISTART", saw_istart), ("ICHARG", saw_icharg),
+            ) if not seen
+        ]
+        raise SystemExit(
+            f"Error: {incar_path} is missing {', '.join(missing)} line(s); "
+            "refusing to guess where to add one"
+        )
+
+    changed = "".join(new_lines) != "".join(lines)
+    if changed and not dry_run:
+        incar_path.write_text("".join(new_lines))
+    return changed
+
+
+def update_incars(source: Path, dry_run: bool = False):
+    calc_dirs = sorted({p.parent for p in source.rglob("POSCAR") if p.is_file()})
+    if not calc_dirs:
+        raise SystemExit(f"No calculation directories with POSCAR found under {source}")
+
+    created = 0
+    updated = 0
+    unchanged = 0
+    for dest in calc_dirs:
+        is_new = not (dest / "INCAR").is_file()
+        if update_incar_for_dir(dest, dry_run=dry_run):
+            if is_new:
+                created += 1
+                verb = "Would create" if dry_run else "Created"
+            else:
+                updated += 1
+                verb = "Would update" if dry_run else "Updated"
+            print(f"{verb}: {dest.relative_to(source)}/INCAR")
+        else:
+            unchanged += 1
+
+    verb = "Would create/update" if dry_run else "Created/updated"
+    print(f"\n{verb}: {created} new, {updated} rewritten, {unchanged} already up to date.")
+
+
 def top_level_vasp_files(source: Path) -> list[Path]:
     """Return only direct-child .vasp files, never nested ones."""
     return sorted(
@@ -274,7 +384,26 @@ def main():
         action="store_true",
         help="Remove erroneously nested subdirectories before processing",
     )
+    parser.add_argument(
+        "--update-incar",
+        action="store_true",
+        help=(
+            "Instead of converting .vasp files, recursively find every calculation "
+            "directory (any dir containing a POSCAR, at any depth) and write its "
+            "INCAR: missing INCARs are created fresh; existing ones have System/MAGMOM "
+            "regenerated from their own POSCAR and ISTART/ICHARG forced to 0/2 "
+            "(single-point jobs must not start from a WAVECAR/CHGCAR), with all other "
+            "settings left untouched."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.update_incar:
+        source = Path(args.directory).resolve()
+        if not source.is_dir():
+            raise SystemExit(f"Error: '{args.directory}' is not a directory")
+        update_incars(source, dry_run=args.dry_run)
+        return
 
     setup_single_point_dft(
         args.directory,
