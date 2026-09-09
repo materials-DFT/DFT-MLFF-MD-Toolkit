@@ -97,12 +97,15 @@ LAMMPS_STABLE_DEFAULTS = {
 # ---------------------------------------------------------------------------
 # Electronic-structure settings.
 #
-# These are mandatory, not inherited-if-convenient. Every VASP INCAR this script
-# writes gets the full block below, whether or not a parent INCAR exists. A
-# parent INCAR may override individual values, but a key can never go missing:
-# when it does, VASP silently falls back to its own defaults (plain PBE,
-# ENCUT = POTCAR ENMAX, ISMEAR = 1, ISPIN = 1) and the run comes out at a
-# completely different level of theory than the rest of the training set.
+# These are mandatory and forced, not inherited-if-convenient. Every VASP INCAR
+# this script writes gets the full block below, whether or not a parent INCAR
+# exists, and regardless of what that parent INCAR says: a source directory
+# copied from an unrelated calculation (a structural optimization, a different
+# level of theory) must not silently carry its settings into an MD run here.
+# Only an explicit CLI override beats these; nothing read from disk does. Leave
+# any of these unset and VASP falls back to its own defaults (plain PBE,
+# ENCUT = POTCAR ENMAX, ISMEAR = 1, ISPIN = 1) -- a completely different level
+# of theory than the rest of the training set.
 # ---------------------------------------------------------------------------
 ELECTRONIC_DEFAULTS = {
     "PREC":    "Normal",
@@ -390,8 +393,14 @@ class MDDirectoryProcessor:
 
     @staticmethod
     def parse_temperature_from_dirname(path: str) -> Optional[int]:
-        """Extract target temperature from a directory name like 300K or 700k."""
-        match = re.fullmatch(r"(\d+)K", os.path.basename(path), re.IGNORECASE)
+        """Extract target temperature from a directory name like 300K.
+
+        Case-sensitive on purpose: this project also uses directory names like
+        0k, 1k, 2k ... for potassium content, which must NOT be mistaken for a
+        temperature. Temperature directories are always capitalized (300K);
+        K-content directories are always lowercase (3k).
+        """
+        match = re.fullmatch(r"(\d+)K", os.path.basename(path))
         return int(match.group(1)) if match else None
     
     def is_structure_dir(self, path: str) -> bool:
@@ -907,29 +916,44 @@ class MDDirectoryProcessor:
     def apply_electronic_defaults(
         self, params: Dict[str, Any], species_list: List[AtomicSpecies]
     ) -> Dict[str, Any]:
-        """Guarantee a complete electronic block in `params`.
+        """Force the electronic block in `params` to the script's own settings.
 
-        Values inherited from a parent INCAR win over the defaults, so a
-        hand-tuned ALGO or a raised ENCUT survives, but no key is ever left out
-        of the written INCAR. Explicit CLI overrides beat both.
+        A source/parent INCAR (e.g. copied from a prior structural
+        optimization, or from an unrelated calculation) is NOT trusted for
+        electronic-structure keys: every key in ELECTRONIC_DEFAULTS is forced
+        to that value regardless of what was already there, and MAGMOM is
+        always regenerated from the actual POSCAR composition. This is
+        deliberate -- a directory seeded from a different calculation must
+        not silently carry over a different level of theory (looser EDIFF,
+        a different NELM, PREC = Accurate, stale MAGMOM, ...). Only an
+        explicit CLI override (--encut, --algo, --magmom, ...) beats the
+        script defaults; nothing inherited from disk does.
         """
-        supplied = []
+        original = dict(params)
+
         for key, value in ELECTRONIC_DEFAULTS.items():
-            if key not in params or str(params[key]).strip() == "":
-                params[key] = value
-                supplied.append(key)
+            params[key] = value
 
         params.update(self.electronic_overrides)
 
-        if str(params.get('ISPIN', '')).strip() == REQUIRED_ISPIN and (
-            'MAGMOM' not in params or str(params.get('MAGMOM', '')).strip() == ""
-        ):
+        if str(params.get('ISPIN', '')).strip() == REQUIRED_ISPIN and 'MAGMOM' not in self.electronic_overrides:
             params['MAGMOM'] = self.build_magmom(species_list)
-            supplied.append('MAGMOM')
 
-        if supplied:
+        # Log against the final, post-override value so a CLI override never
+        # gets reported as if the script default had won.
+        changed = []
+        for key in list(ELECTRONIC_DEFAULTS.keys()) + ['MAGMOM']:
+            if key not in params:
+                continue
+            old = original.get(key)
+            new = params[key]
+            if old is None or str(old).strip() != str(new).strip():
+                changed.append(f"{key}: {old if old is not None else '<missing>'} -> {new}")
+
+        if changed:
             self.log(
-                f"    Electronic keys filled from defaults: {', '.join(supplied)}",
+                "    Electronic keys forced to script defaults (source INCAR ignored):\n      "
+                + "\n      ".join(changed),
                 "INFO",
             )
         return params
