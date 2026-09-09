@@ -9,11 +9,7 @@ CLI: ``python VPS_PSD_evaluation.py DIR … [options]`` opens **only** the PSD +
 cumulative-integral figure (RDF/MSD are still computed internally when needed
 for metadata but are not shown).
 
-Equilibration is detected automatically before the VACF is taken: the start of
-the production window is chosen by maximising the number of effectively
-uncorrelated samples in the remaining segment (Chodera's reverse-cumulative
-rule), so the spectrum and its ∫S→T plateau describe the equilibrated state
-only.  Override with ``--equil none`` or ``--equil N``.
+The full trajectory is used (no equilibration frame skipping).
 
 Physics and formats match the original combined evaluator: Wiener–Khinchin
 linear spectrum Re(FFT(R)), one-sided folding, wavenumber in cm⁻¹, optional
@@ -50,27 +46,6 @@ DEFAULT_PSD_TRIM_MARGIN = 0.10
 DEFAULT_PSD_TRIM_MIN_CM1 = 900.0
 # Odd-length moving average (frequency bins) for PSD lines only; ∫S unchanged.
 DEFAULT_PSD_SMOOTH = 15
-# VACF correlation lags, as a fraction of the number of time origins, when no
-# explicit --vacf-max-lag is given. This is a resolution/noise trade: truncating
-# the VACF at τ_max convolves S(ν̃) with a window of half-width ≈ 1/(τ_max·c), so
-# a short lag range smears neighbouring phonon peaks into one hump, while lag m
-# is averaged over only (n_origins − m) origins and so grows noisy as m → n.
-# Half the origins keeps every lag averaged over ≥50 % of the trajectory while
-# preserving ~1/(0.5·T_run) resolution.
-VACF_AUTO_MAX_LAG_FRACTION = 0.50
-VACF_MIN_MAX_LAG = 256
-# Candidate discard points scanned by the automatic equilibration detector.
-EQUIL_N_CANDIDATES = 200
-# Never discard more than this fraction of the frames automatically. A run whose
-# N_eff keeps improving past this point is drifting rather than equilibrating,
-# and the surviving sliver would be neither equilibrated nor long enough to
-# resolve a spectrum; the cap binds and the run is flagged instead.
-EQUIL_MAX_DISCARD_FRACTION = 0.50
-# Below this many surviving frames the production window is flagged as thin.
-MIN_PRODUCTION_FRAMES = 500
-# Below this many *effectively uncorrelated* samples the production mean is too
-# poorly determined to read the ∫S plateau as an equilibrium temperature.
-MIN_PRODUCTION_NEFF = 100
 ATOMIC_MASS = {
     "H": 1.008, "He": 4.002602, "Li": 6.94, "Be": 9.0121831, "B": 10.81,
     "C": 12.011, "N": 14.007, "O": 15.999, "F": 18.998403163, "Ne": 20.1797,
@@ -568,28 +543,20 @@ def unwrap(pos, cells):
     return uw
 
 
-def _vacf_kernel(vel, max_lag=None):
+def _vacf_kernel(vel):
     """Unnormalized VACF from a velocity array (n_frames, n_atoms, 3).
 
     At τ=0 the value is the mean squared speed ⟨v²⟩ for the sampled atoms
     (in (Å/fs)² when velocities are in Å/fs), up to the usual FFT estimator.
-
-    *Every* frame is used as a time origin; *max_lag* caps only the number of
-    correlation lags returned.  These are independent: R(0) — and therefore the
-    ∫S plateau — is the ⟨v²⟩ average over all origins, while the lag range sets
-    the frequency resolution.  Lag m is averaged over (n_frames − m) origins, so
-    lags approaching n_frames are single-origin noise and must not be fed to the
-    FFT; keep *max_lag* well below n_frames.
     """
     nf, na, nd = vel.shape
-    nlag = nf if max_lag is None else int(max(1, min(max_lag, nf)))
     nfft = 1 << int(np.ceil(np.log2(2 * nf)))
-    norm = np.arange(nf, nf - nlag, -1, dtype=float)
-    c = np.zeros(nlag)
+    norm = np.arange(nf, 0, -1, dtype=float)
+    c = np.zeros(nf)
     for d in range(nd):
         v = vel[:, :, d]
         vf = np.fft.rfft(v, n=nfft, axis=0)
-        ac = np.fft.irfft(vf * np.conj(vf), n=nfft, axis=0)[:nlag]
+        ac = np.fft.irfft(vf * np.conj(vf), n=nfft, axis=0)[:nf]
         c += np.sum(ac, axis=1) / norm
     c /= na
     return c
@@ -713,186 +680,28 @@ def remove_com_velocity(velocities, species):
     return velocities - vcom[:, None, :]
 
 
-def kinetic_temperature_series(unwrapped, dt_fs, species, velocities=None,
-                               vel_to_m_s=None):
-    """Per-frame kinetic temperature (3N−3 DOF) — the equilibration observable.
-
-    Uses trajectory velocities when present, else central finite differences of
-    *unwrapped* (in which case entry *i* refers to frame *i*+1; the one-frame
-    offset is irrelevant at the scale of a discard point).  When the velocity
-    unit is unknown the series is returned unscaled — equilibration detection
-    only cares about its shape.
-    """
-    if velocities is not None:
-        vel = np.asarray(velocities, dtype=float)
-        scale = vel_to_m_s
-    else:
-        vel = (unwrapped[2:] - unwrapped[:-2]) / (2.0 * dt_fs)
-        scale = 1e5
-    masses_kg = _mass_array(species) * AMU_KG
-    ke = 0.5 * np.einsum("a,fad->f", masses_kg, np.asarray(vel) ** 2)
-    ndof = max(3 * len(species) - 3, 1)
-    if scale is None or not np.isfinite(scale):
-        return 2.0 * ke / (ndof * K_B_SI)
-    return 2.0 * ke * (float(scale) ** 2) / (ndof * K_B_SI)
-
-
-def statistical_inefficiency(a):
-    """g = 1 + 2 Σ_t (1 − t/N) C(t), truncated at the first non-positive C(t).
-
-    g is the number of correlated samples per independent one, so a segment of
-    length N holds N/g effectively uncorrelated samples.
-    """
-    a = np.asarray(a, dtype=float)
-    n = a.size
-    if n < 3:
-        return 1.0
-    da = a - a.mean()
-    var = float(np.mean(da * da))
-    if var <= 0.0:
-        return 1.0
-    nfft = 1 << int(np.ceil(np.log2(2 * n)))
-    f = np.fft.rfft(da, n=nfft)
-    ac = np.fft.irfft(f * np.conj(f), n=nfft)[:n]
-    ac = ac / ((n - np.arange(n)) * var)
-    g = 1.0
-    for t in range(1, n):
-        c = ac[t]
-        if c <= 0.0:
-            break
-        g += 2.0 * c * (1.0 - t / n)
-    return float(max(g, 1.0))
-
-
-def detect_equilibration_start(a, n_candidates=EQUIL_N_CANDIDATES,
-                               max_fraction=EQUIL_MAX_DISCARD_FRACTION):
-    """Reverse-cumulative rule: discard point maximising effective samples.
-
-    For each candidate t0 the production segment a[t0:] carries
-    N_eff = (N − t0)/g(t0) uncorrelated samples.  Discarding too little leaves
-    the transient in, which inflates g; discarding too much throws away signal.
-    N_eff peaks between the two, and that peak is the standard automatic choice
-    (Chodera, *J. Chem. Theory Comput.* **12**, 1799 (2016)).
-
-    Candidates are capped at *max_fraction* of the series: a trajectory whose
-    N_eff still improves beyond that is drifting, not equilibrating, and the
-    detector must not be allowed to keep only a sliver of it.
-
-    Returns ``(t0, g, n_eff, capped)``.
-    """
-    a = np.asarray(a, dtype=float)
-    n = a.size
-    if n < 10:
-        return 0, 1.0, float(n), False
-    hi = max(1, min(int(n * float(max_fraction)), n - 10))
-    cands = np.unique(
-        np.linspace(0, hi, min(int(n_candidates), hi)).astype(int)
-    )
-    best = (0, 1.0, -np.inf)
-    for t0 in cands:
-        seg = a[int(t0):]
-        g = statistical_inefficiency(seg)
-        n_eff = seg.size / g
-        if n_eff > best[2]:
-            best = (int(t0), g, float(n_eff))
-    # The cap binds when the best candidate sits at the very end of the scanned
-    # range, i.e. N_eff was still rising where we had to stop looking.
-    capped = bool(best[0] >= int(cands[-1]) and cands[-1] > 0)
-    return best[0], best[1], best[2], capped
-
-
-def resolve_equilibration_start(series, equil):
-    """Map the --equil setting onto a start frame; returns (start, message)."""
-    n = len(series)
-    if n < 3:
-        return 0, "too few frames to test; using all"
-    if equil in (None, "auto"):
-        t0, g, n_eff, capped = detect_equilibration_start(series)
-        msg = (
-            f"auto: discard {t0} frame(s), keep {n - t0} "
-            f"(g={g:.1f}, N_eff={n_eff:.0f})"
-        )
-        if capped:
-            msg += (
-                f" [CAPPED at {EQUIL_MAX_DISCARD_FRACTION:.0%}: N_eff was still"
-                " rising, so this run is drifting rather than equilibrating —"
-                " treat its plateau as a time average, not an equilibrium value]"
-            )
-    elif equil == "none":
-        return 0, "disabled (--equil none): full trajectory"
-    else:
-        t0 = max(0, min(int(equil), max(n - 3, 0)))
-        msg = f"manual (--equil {equil}): discard {t0} frame(s), keep {n - t0}"
-    finite = np.isfinite(series)
-    if finite.any():
-        pre = float(np.mean(series[:t0][finite[:t0]])) if t0 else float("nan")
-        prod = np.asarray(series[t0:])[finite[t0:]]
-        post = float(np.mean(prod))
-        # Standard error of a correlated mean: σ·sqrt(g/N) = σ/sqrt(N_eff).
-        g_prod = statistical_inefficiency(prod)
-        n_eff_prod = prod.size / g_prod if g_prod > 0 else float(prod.size)
-        se = float(np.std(prod) / np.sqrt(n_eff_prod)) if n_eff_prod > 0 else float("nan")
-        msg += (
-            f"; ⟨T⟩ discarded={pre:.1f} K, "
-            f"production={post:.1f} ± {se:.1f} K (N_eff={n_eff_prod:.0f})"
-        )
-        if n_eff_prod < MIN_PRODUCTION_NEFF:
-            msg += (
-                f" [only {n_eff_prod:.0f} independent samples — the plateau is"
-                " a drifting time average, not a converged equilibrium T]"
-            )
-    return t0, msg
-
-
-def resolve_vacf_max_lag(n_origins, max_lag=None):
-    """Correlation-lag cap in frames: explicit value, else ~10 % of the origins.
-
-    The automatic value is bounded below by ``VACF_MIN_MAX_LAG`` so short
-    trajectories keep usable frequency resolution.  An explicit *max_lag* is
-    honoured up to *n_origins*, but note that lags near *n_origins* are averaged
-    over only a handful of time origins and are mostly noise.
-    """
-    if max_lag:
-        return int(max(1, min(int(max_lag), n_origins)))
-    auto = int(round(VACF_AUTO_MAX_LAG_FRACTION * n_origins))
-    return int(max(1, min(max(auto, VACF_MIN_MAX_LAG), n_origins)))
-
-
-def compute_vacf(unwrapped, dt_fs, n_frames=None, velocities=None, max_lag=None):
+def compute_vacf(unwrapped, dt_fs, n_frames=5000, velocities=None):
     """VACF via FFT: unnormalized series and C(τ)/C(0).
 
     Uses *velocities* directly when available (LAMMPS extxyz),
     otherwise falls back to central finite-differences of *unwrapped*.
-
-    *n_frames* caps how many frames serve as time origins (``None`` = all of
-    them); *max_lag* caps the correlation lags returned.  See ``_vacf_kernel``
-    for why these must stay separate.
     """
-    avail = len(unwrapped) - 2
-    nv = avail if not n_frames else min(int(n_frames), avail)
+    nv = min(n_frames, len(unwrapped) - 2)
     if velocities is not None:
         vel = velocities[:nv]
         tag = "from trajectory"
     else:
         vel = (unwrapped[2:nv + 2] - unwrapped[:nv]) / (2.0 * dt_fs)
         tag = "finite-diff"
-    nlag = resolve_vacf_max_lag(len(vel), max_lag)
-    tau_max_s = nlag * float(dt_fs) * 1e-15
-    res_cm1 = 1.0 / (tau_max_s * SPEED_OF_LIGHT_CM_S) if tau_max_s > 0 else float("inf")
-    print(
-        f"    VACF / spectrum: {len(vel)} time origins ({tag}), "
-        f"max lag {nlag} frames = {nlag * dt_fs:.0f} fs "
-        f"(≈{res_cm1:.0f} cm⁻¹ resolution)"
-    )
-    vacf_raw = _vacf_kernel(vel, max_lag=nlag)
+    print(f"    VACF / spectrum: {len(vel)} frames ({tag})")
+    vacf_raw = _vacf_kernel(vel)
     v0 = vacf_raw[0]
     vacf_norm = (vacf_raw / v0) if v0 != 0 else vacf_raw
     t = np.arange(len(vacf_raw)) * dt_fs * 1e-3   # ps
     return t, vacf_norm, vacf_raw
 
 
-def compute_vacf_by_species(unwrapped, dt_fs, species, n_frames=None,
-                            velocities=None, max_lag=None):
+def compute_vacf_by_species(unwrapped, dt_fs, species, n_frames=5000, velocities=None):
     """Compute VACF per species: normalized (for export) and raw (for PSD / ⟨v²⟩)."""
     sp = np.array(species)
     out_norm, out_raw = {}, {}
@@ -904,7 +713,6 @@ def compute_vacf_by_species(unwrapped, dt_fs, species, n_frames=None,
             dt_fs,
             n_frames=n_frames,
             velocities=vel_s,
-            max_lag=max_lag,
         )
         out_norm[s] = vacf_n
         out_raw[s] = vacf_r
@@ -1989,7 +1797,7 @@ def make_figure(results_list, labels,
 def analyze_one(directory, skip, max_frames,
                 rdf_stride, vacf_nframes, rdf_rmax, rdf_nbins,
                 dt_override=None, use_precomputed_msd=False,
-                compute_psd=True, vacf_max_lag=None, equil="auto"):
+                compute_psd=True):
     d = Path(directory).resolve()
     print(f"\n{'═' * 60}")
     print(f"  {d}")
@@ -2071,28 +1879,10 @@ def analyze_one(directory, skip, max_frames,
     if vel is None:
         vel_to_m_s = 1e5
 
-    eq_start, eq_msg, eq_T_prod = 0, "not run (PSD disabled)", None
     if compute_psd:
-        # The ∫S plateau is ⟨v²⟩ over whichever frames act as time origins, so
-        # the transient has to be dropped here — not corrected for afterwards.
-        t_series = kinetic_temperature_series(
-            uw, dt, species, velocities=vel_corr, vel_to_m_s=vel_to_m_s,
-        )
-        eq_start, eq_msg = resolve_equilibration_start(t_series, equil)
-        print(f"  Equilibration: {eq_msg}")
-        if eq_start and len(t_series) - eq_start < MIN_PRODUCTION_FRAMES:
-            print(
-                f"    Warning: only {len(t_series) - eq_start} production "
-                f"frame(s) survive; the trajectory may not be equilibrated."
-            )
-        eq_T_prod = float(np.mean(t_series[eq_start:]))
-        uw_prod = uw[eq_start:]
-        vel_prod = vel_corr[eq_start:] if vel_corr is not None else None
-
         print(f"  Power spectrum (from VACF) ...")
         vacf_t, vacf, vacf_raw = compute_vacf_by_species(
-            uw_prod, dt, species, n_frames=vacf_nframes,
-            velocities=vel_prod, max_lag=vacf_max_lag,
+            uw, dt, species, n_frames=vacf_nframes, velocities=vel_corr
         )
         if vel_to_m_s is None:
             print("  Velocity units: LJ — PSD uses raw ⟨v²⟩; kinetic T in K not defined")
@@ -2136,25 +1926,19 @@ def analyze_one(directory, skip, max_frames,
 
     psd_cumint_T = {}
     T_kin_vacf0_K = {}
-    # COM motion was subtracted from the velocities, leaving 3N-3 DOF, but the
-    # equipartition conversion divides by 3 per atom. Rescale so T matches the
-    # engine's own 3N-3 definition (LAMMPS `thermo temp`); without this the
-    # plateau sits a fixed 1/N low.
-    n_at = int(pos.shape[1])
-    dof_corr = (3.0 * n_at) / (3.0 * n_at - 3.0) if n_at > 1 else 1.0
     if compute_psd and psd_cumint:
         for spec in psd_cumint:
             m_amu = ATOMIC_MASS.get(spec, 1.0)
             if psd_vacf_si:
-                psd_cumint_T[spec] = dof_corr * kinetic_temperature_from_mean_v_squared(
+                psd_cumint_T[spec] = kinetic_temperature_from_mean_v_squared(
                     psd_cumint[spec], m_amu, 1.0,
                 )
             else:
-                psd_cumint_T[spec] = dof_corr * kinetic_temperature_from_mean_v_squared(
+                psd_cumint_T[spec] = kinetic_temperature_from_mean_v_squared(
                     psd_cumint[spec], m_amu, None,
                 )
             T_kin_vacf0_K[spec] = float(
-                dof_corr * kinetic_temperature_from_mean_v_squared(
+                kinetic_temperature_from_mean_v_squared(
                     vacf_raw[spec][0], m_amu, vel_to_m_s,
                 )
             )
@@ -2176,11 +1960,6 @@ def analyze_one(directory, skip, max_frames,
         "nominal_temperature_K": nominal_T,
         "T_kin_from_vacf0_K": T_kin_vacf0_K,
         "psd_vacf_si": psd_vacf_si,
-        "equilibration_start_frame": int(eq_start),
-        "equilibration_detection": eq_msg,
-        "production_frames": int(max(nf - eq_start, 0)),
-        "T_mean_production_K": eq_T_prod,
-        "kinetic_T_dof_correction": float(dof_corr),
     }
     return dict(
         vacf_t=vacf_t,
@@ -2300,11 +2079,6 @@ def write_data_log(out_path, sim_dirs, labels, all_results):
                     "nominal_temperature_K",
                     "T_kin_from_vacf0_K",
                     "psd_vacf_si",
-                    "equilibration_start_frame",
-                    "equilibration_detection",
-                    "production_frames",
-                    "T_mean_production_K",
-                    "kinetic_T_dof_correction",
                 ):
                     if k in m:
                         fh.write(f"# meta.{k}={m[k]}\n")
@@ -2459,32 +2233,8 @@ Examples:
     ap.add_argument(
         "--vacf-frames",
         type=int,
-        default=0,
-        help=(
-            "cap on time origins for the VACF, counted after equilibration "
-            "(default: 0 = use every production frame)"
-        ),
-    )
-    ap.add_argument(
-        "--vacf-max-lag",
-        type=int,
-        default=0,
-        help=(
-            "cap on VACF correlation lags in frames; resolution is "
-            "≈1/(max_lag·dt·c), so lowering this smears neighbouring phonon "
-            f"peaks together (default: 0 = {VACF_AUTO_MAX_LAG_FRACTION:.0%} of "
-            f"the time origins, at least {VACF_MIN_MAX_LAG})"
-        ),
-    )
-    ap.add_argument(
-        "--equil",
-        default="auto",
-        metavar="auto|none|N",
-        help=(
-            "production window for the VACF: 'auto' detects the equilibration "
-            "point by maximising effective sample size (default), 'none' uses "
-            "the whole trajectory, N discards the first N frames"
-        ),
+        default=5000,
+        help="frames for VACF / power spectrum (default: 5000)",
     )
     ap.add_argument(
         "--rdf-stride",
@@ -2579,18 +2329,6 @@ Examples:
     args = ap.parse_args()
     skip_frames = 0
 
-    equil = args.equil.strip().lower()
-    if equil not in ("auto", "none"):
-        try:
-            equil = int(equil)
-        except ValueError:
-            ap.error(
-                f"--equil expects 'auto', 'none', or an integer frame count, "
-                f"got {args.equil!r}"
-            )
-        if equil < 0:
-            ap.error("--equil frame count must be >= 0")
-
     sim_dirs, origin_indices = resolve_dirs(args.dirs)
 
     print(f"Resolved {len(sim_dirs)} simulation(s):")
@@ -2610,8 +2348,6 @@ Examples:
             dt_override=args.dt,
             use_precomputed_msd=args.precomputed_msd,
             compute_psd=True,
-            vacf_max_lag=args.vacf_max_lag,
-            equil=equil,
         )
         all_res.append(res)
 

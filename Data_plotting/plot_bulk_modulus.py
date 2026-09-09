@@ -39,43 +39,120 @@ class BulkModulusAnalyzer:
         
     def extract_volume_energy(self, outcar_path):
         """
-        Extract volume and energy from OUTCAR file.
-        
+        Extract volume, energy, max atomic force, and hydrostatic pressure
+        (external pressure) from OUTCAR file.
+
         Parameters:
         -----------
         outcar_path : str or Path
             Path to OUTCAR file
-            
+
         Returns:
         --------
-        tuple : (volume, energy) or (None, None) if extraction fails
+        tuple : (volume, energy, max_force, pressure_gpa) or (None, None, None, None)
+            if volume/energy extraction fails. max_force is the largest per-atom
+            force magnitude (eV/Angst) in the final ionic step; pressure_gpa is
+            the "external pressure" (GPa) from the final ionic step's stress
+            tensor. Either can be None if it could not be parsed.
         """
         try:
             with open(outcar_path, 'r') as f:
                 content = f.read()
-                
+
             # Extract volume - look for "volume of cell :      XXX.XX"
             vol_pattern = r'volume of cell\s*:\s*([\d.]+)'
             vol_match = re.findall(vol_pattern, content)
             if vol_match:
                 volume = float(vol_match[-1])  # Take the last occurrence (final volume)
             else:
-                return None, None
-                
+                return None, None, None, None
+
             # Extract energy - look for final "free energy    TOTEN  =     -XXXX.XXXXX eV"
             energy_pattern = r'free\s+energy\s+TOTEN\s+=\s+([\d.-]+)\s+eV'
             energy_matches = re.findall(energy_pattern, content)
             if energy_matches:
                 energy = float(energy_matches[-1])  # Take the last occurrence (final energy)
             else:
-                return None, None
-                
-            return volume, energy
-            
+                return None, None, None, None
+
+            max_force = self.extract_max_force(content)
+            pressure_gpa = self.extract_pressure(content)
+
+            return volume, energy, max_force, pressure_gpa
+
         except Exception as e:
             print(f"Error reading {outcar_path}: {e}")
-            return None, None
-    
+            return None, None, None, None
+
+    def extract_max_force(self, content):
+        """
+        Extract the max per-atom force magnitude from the final ionic step's
+        TOTAL-FORCE block in OUTCAR content.
+
+        Parameters:
+        -----------
+        content : str
+            Full text content of an OUTCAR file
+
+        Returns:
+        --------
+        float or None : max |force| (eV/Angst) in the last TOTAL-FORCE block,
+            or None if the block could not be parsed.
+        """
+        blocks = content.split('TOTAL-FORCE (eV/Angst)')
+        if len(blocks) < 2:
+            return None
+
+        last_block = blocks[-1]
+        forces = []
+        started = False
+        for line in last_block.splitlines():
+            stripped = line.strip()
+            if stripped and set(stripped) <= {'-'}:
+                if started:
+                    break
+                started = True
+                continue
+            if not started:
+                continue
+            parts = stripped.split()
+            if len(parts) != 6:
+                break
+            try:
+                fx, fy, fz = float(parts[3]), float(parts[4]), float(parts[5])
+            except ValueError:
+                break
+            forces.append((fx, fy, fz))
+
+        if not forces:
+            return None
+
+        forces = np.array(forces)
+        return float(np.max(np.linalg.norm(forces, axis=1)))
+
+    def extract_pressure(self, content):
+        """
+        Extract the hydrostatic "external pressure" from the final ionic
+        step's stress tensor in OUTCAR content.
+
+        Parameters:
+        -----------
+        content : str
+            Full text content of an OUTCAR file
+
+        Returns:
+        --------
+        float or None : external pressure (GPa) at the final ionic step,
+            or None if it could not be parsed. VASP reports this in kB
+            (1 kB = 0.1 GPa); positive means compressive.
+        """
+        pressure_pattern = r'external pressure\s*=\s*([-\d.]+)\s*kB'
+        matches = re.findall(pressure_pattern, content)
+        if not matches:
+            return None
+        pressure_kb = float(matches[-1])  # Final ionic step
+        return pressure_kb * 0.1  # kB -> GPa
+
     def parse_directory_structure(self):
         """Parse directory structure and extract data from all OUTCAR files."""
         print("Scanning directory structure...")
@@ -119,15 +196,17 @@ class BulkModulusAnalyzer:
                 continue
             vol_pct = float(vol_pct_match.group(1))
             
-            # Extract volume and energy
-            volume, energy = self.extract_volume_energy(outcar_path)
-            
+            # Extract volume, energy, max atomic force, and pressure
+            volume, energy, max_force, pressure_gpa = self.extract_volume_energy(outcar_path)
+
             if volume is not None and energy is not None:
                 if compound not in self.data:
                     self.data[compound] = {}
                 self.data[compound][vol_pct] = {
                     'volume': volume,
                     'energy': energy,
+                    'max_force': max_force,
+                    'pressure_gpa': pressure_gpa,
                     'path': str(outcar_path)
                 }
         
@@ -306,7 +385,7 @@ class BulkModulusAnalyzer:
             return
         
         n_compounds = len(self.data)
-        fig, ax = plt.subplots(figsize=(14, 10))
+        fig, (ax, ax_force, ax_stress) = plt.subplots(3, 1, figsize=(14, 22), constrained_layout=True)
         
         # Generate colors for each compound
         colors = plt.cm.tab20(np.linspace(0, 1, n_compounds))
@@ -320,20 +399,29 @@ class BulkModulusAnalyzer:
             vol_pcts = sorted(data.keys())
             volumes = np.array([data[v]['volume'] for v in vol_pcts])
             energies = np.array([data[v]['energy'] for v in vol_pcts])
-            
+            forces_raw = [data[v].get('max_force') for v in vol_pcts]
+            force_mask = np.array([f is not None for f in forces_raw])
+            forces = np.array([f for f in forces_raw if f is not None])
+            force_volumes = volumes[force_mask]
+
+            pressures_raw = [data[v].get('pressure_gpa') for v in vol_pcts]
+            pressure_mask = np.array([p is not None for p in pressures_raw])
+            pressures = np.array([p for p in pressures_raw if p is not None])
+            pressure_volumes = volumes[pressure_mask]
+
             # Fit EOS to get E0 (equilibrium energy)
             fit_result = self.fit_eos(volumes, energies)
-            
+
             if fit_result:
                 E0 = fit_result['E0']
                 energies_normalized = energies - E0
                 all_normalized_energies.extend(energies_normalized.tolist())
-                
+
                 # Store plot data
                 V_fit = np.linspace(volumes.min() * 0.95, volumes.max() * 1.05, 200)
                 E_fit = self.birch_murnaghan_eos(V_fit, *fit_result['popt'])
                 E_fit_normalized = E_fit - E0
-                
+
                 plot_data.append({
                     'compound': compound,
                     'volumes': volumes,
@@ -341,14 +429,18 @@ class BulkModulusAnalyzer:
                     'V_fit': V_fit,
                     'E_fit_norm': E_fit_normalized,
                     'color': colors[i],
-                    'fit_result': fit_result
+                    'fit_result': fit_result,
+                    'force_volumes': force_volumes,
+                    'forces': forces,
+                    'pressure_volumes': pressure_volumes,
+                    'pressures': pressures
                 })
             else:
                 # If fit failed, just normalize by minimum energy
                 E0 = np.min(energies)
                 energies_normalized = energies - E0
                 all_normalized_energies.extend(energies_normalized.tolist())
-                
+
                 plot_data.append({
                     'compound': compound,
                     'volumes': volumes,
@@ -356,7 +448,11 @@ class BulkModulusAnalyzer:
                     'V_fit': None,
                     'E_fit_norm': None,
                     'color': colors[i],
-                    'fit_result': None
+                    'fit_result': None,
+                    'force_volumes': force_volumes,
+                    'forces': forces,
+                    'pressure_volumes': pressure_volumes,
+                    'pressures': pressures
                 })
         
         # Calculate y-axis limits from all data (use full range to show all points)
@@ -395,30 +491,68 @@ class BulkModulusAnalyzer:
             if data['V_fit'] is not None and data['E_fit_norm'] is not None:
                 V_fit = data['V_fit']
                 E_fit_norm = data['E_fit_norm']
-                ax.plot(V_fit, E_fit_norm, '-', linewidth=2, color=color, 
+                ax.plot(V_fit, E_fit_norm, '-', linewidth=2, color=color,
                        alpha=0.7, zorder=2)
                 print(f"    -> Fitted curve plotted")
             else:
                 print(f"    -> No fitted curve (insufficient points or fit failed)")
-        
+
+            # Plot max atomic force vs volume on the second subplot
+            force_volumes = data['force_volumes']
+            forces = data['forces']
+            if len(forces) > 0:
+                ax_force.plot(force_volumes, forces, 'o-', linewidth=1.5, markersize=6,
+                              alpha=0.7, color=color, label=compound, zorder=3)
+            else:
+                print(f"    -> No force data (could not parse TOTAL-FORCE block)")
+
+            # Plot DFT external pressure (stress) vs volume
+            pressure_volumes = data['pressure_volumes']
+            pressures = data['pressures']
+            if len(pressures) > 0:
+                ax_stress.plot(pressure_volumes, pressures, 'o-', linewidth=1.5, markersize=6,
+                               alpha=0.7, color=color, label=compound, zorder=3)
+            else:
+                print(f"    -> No pressure data (could not parse 'external pressure')")
+
         # Set y-axis limits (symmetric around zero)
         ax.set_ylim(-y_limit, y_limit)
-        
+
         ax.set_xlabel('Volume (Å³)', fontsize=14)
         ax.set_ylabel('Energy - E₀ (eV)', fontsize=14)
-        ax.set_title('Bulk Modulus: Normalized Energy vs Volume\n(All data included, no outliers removed)', 
-                    fontsize=16, fontweight='bold')
-        ax.legend(fontsize=8, ncol=3, loc='best', framealpha=0.9)
+        ax.set_title(
+            f'Bulk Modulus: Normalized Energy vs Volume\n'
+            f'(All data included, no outliers removed; y-range ±{y_limit:.1f} eV, '
+            f'{n_compounds} compound(s))',
+            fontsize=14, fontweight='bold'
+        )
+        ax.legend(fontsize=8, loc='upper left', bbox_to_anchor=(1.01, 1.0),
+                 borderaxespad=0, framealpha=0.9)
         ax.grid(True, alpha=0.3)
         ax.axhline(y=0, color='k', linestyle='--', linewidth=1, alpha=0.5)
-        
-        # Add text annotation about y-axis limits
-        annotation_text = f'Y-axis range: ±{y_limit:.1f} eV\n(All {n_compounds} compound(s) plotted)'
-        ax.text(0.02, 0.98, annotation_text, 
-               transform=ax.transAxes, fontsize=9, verticalalignment='top',
-               bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
-        
-        plt.tight_layout()
+
+        ax_force.set_xlabel('Volume (Å³)', fontsize=14)
+        ax_force.set_ylabel('Max atomic force (eV/Å, log scale)', fontsize=14)
+        ax_force.set_title('Max Atomic Force vs Volume', fontsize=14, fontweight='bold')
+        ax_force.set_yscale('log')
+        ax_force.legend(fontsize=8, loc='upper left', bbox_to_anchor=(1.01, 1.0),
+                        borderaxespad=0, framealpha=0.9)
+        ax_force.grid(True, alpha=0.3, which='both')
+
+        ax_stress.set_xlabel('Volume (Å³)', fontsize=14)
+        ax_stress.set_ylabel('External pressure (GPa, symlog scale)', fontsize=14)
+        ax_stress.set_title('Stress (External Pressure) vs Volume', fontsize=14, fontweight='bold')
+        # symlog: pressure goes negative in tension (expansion) and spans orders
+        # of magnitude in compression, so linear/log alone can't show both.
+        ax_stress.set_yscale('symlog', linthresh=10)
+        ax_stress.legend(fontsize=8, loc='upper left', bbox_to_anchor=(1.01, 1.0),
+                         borderaxespad=0, framealpha=0.9)
+        ax_stress.grid(True, alpha=0.3, which='both')
+        ax_stress.axhline(y=0, color='k', linestyle='--', linewidth=1, alpha=0.5)
+
+        # Legends live outside the axes (right side); constrained_layout
+        # reserves space for them and for wrapped titles automatically,
+        # so nothing gets cropped regardless of title length or compound count.
         plt.show()
     
     def generate_summary_table(self):
